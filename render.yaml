@@ -1,7 +1,9 @@
 services:
+  # Production: tracks `main`. URL: https://backgammon-display.onrender.com
   - type: web
     name: backgammon-display
     runtime: static
+    branch: main
     buildCommand: ""
     staticPublishPath: .
     pullRequestPreviewsEnabled: false
@@ -9,6 +11,27 @@ services:
       - path: /*
         name: X-Frame-Options
         value: SAMEORIGIN
+      - path: /*
+        name: Cache-Control
+        value: public, max-age=0, must-revalidate
+
+  # Staging: tracks `staging`. URL: https://backgammon-display-staging.onrender.com
+  # Push experimental work to the `staging` branch first, verify on-device,
+  # then merge to `main` for production.
+  - type: web
+    name: backgammon-display-staging
+    runtime: static
+    branch: staging
+    buildCommand: ""
+    staticPublishPath: .
+    pullRequestPreviewsEnabled: false
+    headers:
+      - path: /*
+        name: X-Frame-Options
+        value: SAMEORIGIN
+      - path: /*
+        name: X-Robots-Tag
+        value: noindex
       - path: /*
         name: Cache-Control
         value: public, max-age=0, must-revalidate

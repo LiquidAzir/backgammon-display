@@ -42,12 +42,20 @@ Arrow keys + Enter simulate the Neural Band on desktop.
 
 ## Deploy
 
-Hosted as a static site — any HTTPS host works. Configured for [Render](https://render.com) via `render.yaml`:
+Hosted as a static site — any HTTPS host works. Configured for [Render](https://render.com) via `render.yaml` with two environments:
 
-1. Push to GitHub (this repo)
-2. On Render → **New +** → **Static Site** → connect this repo
-3. Render reads `render.yaml` and serves the root directory as static files
-4. Once live, add the deployed URL to the glasses via the Meta AI app → Devices → Display Glasses → App connections → Web apps
+| Branch | Render service | URL |
+|--------|---------------|-----|
+| `main` | `backgammon-display` | https://backgammon-display.onrender.com |
+| `staging` | `backgammon-display-staging` | https://backgammon-display-staging.onrender.com |
+
+Workflow:
+
+1. Develop on a feature branch
+2. Merge to `staging` first — Render auto-deploys to the staging URL. Verify on-device.
+3. When happy, merge `staging` → `main` to ship to production.
+
+Once live, add the production URL to the glasses via the Meta AI app → Devices → Display Glasses → App connections → Web apps.
 
 ## Files
 

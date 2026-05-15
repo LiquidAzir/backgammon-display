@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=600, height=600, initial-scale=1.0, user-scalable=no">
+  <title>Backgammon</title>
+  <link rel="icon" type="image/png" href="favicon.png">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="app">
+
+    <div id="home" class="screen">
+      <div class="home-content">
+        <div class="home-emblem">
+          <span class="emblem-tri emblem-tri-light"></span>
+          <span class="emblem-tri emblem-tri-dark"></span>
+          <span class="emblem-tri emblem-tri-light"></span>
+          <span class="emblem-tri emblem-tri-dark"></span>
+        </div>
+        <h1 class="home-title">Backgammon</h1>
+        <p class="home-sub">Single player &middot; vs computer</p>
+        <button class="primary-btn focusable" data-action="new-game">Play</button>
+      </div>
+    </div>
+
+    <div id="game" class="screen hidden">
+      <header class="game-header">
+        <div class="hdr-player hdr-white">
+          <span class="hdr-chip white"></span>
+          <span class="hdr-count" id="white-remaining">15</span>
+        </div>
+        <div class="hdr-status" id="status-text">Roll to begin</div>
+        <div class="hdr-player hdr-black">
+          <span class="hdr-count" id="black-remaining">15</span>
+          <span class="hdr-chip black"></span>
+        </div>
+      </header>
+
+      <div class="board" id="board">
+        <div class="row row-top" id="row-top">
+          <div class="half half-left" id="row-top-left"></div>
+          <div class="bar-col bar-col-top">
+            <button class="bar-checker focusable hidden" id="bar-w" data-zone="bar" data-side="w"></button>
+            <button class="bar-checker focusable hidden" id="bar-b" data-zone="bar" data-side="b"></button>
+          </div>
+          <div class="half half-right" id="row-top-right"></div>
+        </div>
+        <div class="midbar">
+          <div class="midbar-label" id="midbar-label"></div>
+        </div>
+        <div class="row row-bot" id="row-bot">
+          <div class="half half-left" id="row-bot-left"></div>
+          <div class="bar-col bar-col-bot"></div>
+          <div class="half half-right" id="row-bot-right"></div>
+        </div>
+        <div class="off-tray off-tray-top" id="off-black-tray"></div>
+        <div class="off-tray off-tray-bot" id="off-white-tray"></div>
+      </div>
+
+      <div class="action-panel">
+        <div class="dice-area" id="dice-area">
+          <div class="dice-placeholder">Press Roll</div>
+        </div>
+        <div class="action-buttons" id="action-buttons">
+          <button class="action-btn primary focusable" id="roll-btn" data-action="roll" data-zone="action" data-idx="0">Roll Dice</button>
+          <button class="action-btn focusable hidden" id="undo-btn" data-action="undo" data-zone="action" data-idx="1">Undo</button>
+          <button class="action-btn focusable hidden" id="end-btn" data-action="end-turn" data-zone="action" data-idx="2">End Turn</button>
+          <button class="action-btn focusable hidden" id="bear-btn" data-action="bear-off" data-zone="action" data-idx="3">Bear Off</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="gameover" class="screen hidden">
+      <div class="home-content">
+        <div class="winner-emblem" id="winner-emblem"></div>
+        <h1 class="home-title" id="winner-title">You win!</h1>
+        <p class="home-sub" id="winner-sub"></p>
+        <button class="primary-btn focusable" data-action="new-game">Play Again</button>
+        <button class="secondary-btn focusable" data-action="home">Home</button>
+      </div>
+    </div>
+
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>

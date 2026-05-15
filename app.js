@@ -9,6 +9,7 @@
   var AI_SELECT_DELAY = 550;
   var AI_MOVE_DELAY = 500;
   var END_TURN_DELAY = 700;
+  var STORAGE_KEY = 'mdg_backgammon';
 
   // =================== STATE ===================
   var state = {
@@ -53,6 +54,57 @@
 
   function deepClone(g) {
     return JSON.parse(JSON.stringify(g));
+  }
+
+  // =================== PERSISTENCE ===================
+  // Save only at stable points (not mid-AI animation). The saved snapshot is
+  // always either a fresh game or a state where it's the human's turn — so
+  // resuming never lands in the middle of the computer thinking.
+  function saveGame() {
+    if (!state.game) return;
+    if (state.aiBusy) return;
+    if (state.game.winner) { clearSavedGame(); return; }
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(state.game));
+    } catch (e) {
+      // quota or disabled — silently ignore
+    }
+  }
+
+  function loadSavedGame() {
+    try {
+      var raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) return null;
+      var g = JSON.parse(raw);
+      // Basic shape validation — anything off, treat as no save
+      if (!g || !Array.isArray(g.board) || g.board.length !== 24) return null;
+      if (g.winner) return null;
+      return g;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function clearSavedGame() {
+    try { localStorage.removeItem(STORAGE_KEY); } catch (e) {}
+  }
+
+  function updateHomeButtons() {
+    var saved = loadSavedGame();
+    var contBtn = document.getElementById('continue-btn');
+    var playBtn = document.getElementById('play-btn');
+    if (!contBtn || !playBtn) return;
+    if (saved) {
+      contBtn.classList.remove('hidden');
+      playBtn.classList.remove('primary-btn');
+      playBtn.classList.add('secondary-btn');
+      playBtn.textContent = 'New Game';
+    } else {
+      contBtn.classList.add('hidden');
+      playBtn.classList.remove('secondary-btn');
+      playBtn.classList.add('primary-btn');
+      playBtn.textContent = 'Play';
+    }
   }
 
   // =================== RULES ===================
@@ -527,6 +579,7 @@
     if (screens[id]) {
       screens[id].classList.remove('hidden');
       state.currentScreen = id;
+      if (id === 'home') updateHomeButtons();
       setTimeout(function () { focusFirstActionable(); }, 50);
     }
   }
@@ -668,6 +721,18 @@
     state.game = newGameState();
     state.snapshot = null;
     state.aiBusy = false;
+    saveGame();
+    navigateTo('game', { addToHistory: state.currentScreen === 'home' });
+    renderGame();
+    setTimeout(focusFirstActionable, 80);
+  }
+
+  function continueSavedGame() {
+    var saved = loadSavedGame();
+    if (!saved) return;
+    state.game = saved;
+    state.snapshot = null;
+    state.aiBusy = false;
     navigateTo('game', { addToHistory: state.currentScreen === 'home' });
     renderGame();
     setTimeout(focusFirstActionable, 80);
@@ -694,6 +759,7 @@
     if (!g || g.turn !== COLOR_W || g.phase !== 'need-roll' || state.aiBusy) return;
     rollDice();
     state.snapshot = null;
+    saveGame();
     renderGame();
     if (allLegalMoves(g).length === 0) {
       showToast('No legal moves');
@@ -707,6 +773,7 @@
     var g = state.game;
     g.selected = src;
     g.legalDests = legalMovesForSelection(g, src);
+    saveGame();
     renderGame();
     setTimeout(focusFirstDest, 20);
   }
@@ -715,6 +782,7 @@
     var g = state.game;
     g.selected = null;
     g.legalDests = [];
+    saveGame();
     renderGame();
     setTimeout(focusFirstActionable, 20);
   }
@@ -729,10 +797,12 @@
     if (w) {
       g.winner = w;
       g.phase = 'gameover';
+      clearSavedGame();
       renderGame();
       setTimeout(showGameOver, 900);
       return;
     }
+    saveGame();
     renderGame();
     if (g.diceRemaining.length === 0 || allLegalMoves(g).length === 0) {
       if (g.diceRemaining.length > 0) showToast('No more moves');
@@ -771,6 +841,7 @@
     if (!state.snapshot || state.aiBusy) return;
     state.game = state.snapshot;
     state.snapshot = null;
+    saveGame();
     renderGame();
     setTimeout(focusFirstActionable, 30);
   }
@@ -827,6 +898,7 @@
         if (w) {
           g.winner = w;
           g.phase = 'gameover';
+          clearSavedGame();
           renderGame();
           setTimeout(function () {
             state.aiBusy = false;
@@ -853,6 +925,7 @@
     g.phase = g.winner ? 'gameover' : 'need-roll';
     state.aiBusy = false;
     state.snapshot = null;
+    saveGame();
     renderGame();
     setTimeout(focusFirstActionable, 30);
   }
@@ -874,6 +947,7 @@
   function handleAction(action) {
     switch (action) {
       case 'new-game': startNewGame(); break;
+      case 'continue': continueSavedGame(); break;
       case 'home':
         state.screenHistory = [];
         navigateTo('home', { addToHistory: false });

@@ -26,13 +26,28 @@
       </div>
     </div>
 
+    <div id="match-setup" class="screen hidden">
+      <div class="home-content">
+        <h1 class="home-title small">Match length</h1>
+        <p class="home-sub" id="setup-sub">Choose how many games to play</p>
+        <button class="primary-btn focusable" data-action="match-1">Single Game</button>
+        <button class="primary-btn focusable" data-action="match-3">Best of 3</button>
+        <button class="primary-btn focusable" data-action="match-5">Best of 5</button>
+        <button class="primary-btn focusable" data-action="match-7">Best of 7</button>
+        <button class="secondary-btn focusable" data-action="home">Back</button>
+      </div>
+    </div>
+
     <div id="game" class="screen hidden">
       <header class="game-header">
         <div class="hdr-player hdr-white">
           <span class="hdr-chip white"></span>
           <span class="hdr-count" id="white-remaining">15</span>
         </div>
-        <div class="hdr-status" id="status-text">Roll to begin</div>
+        <div class="hdr-status">
+          <div class="hdr-status-main" id="status-text">Roll to begin</div>
+          <div class="hdr-status-sub" id="match-score"></div>
+        </div>
         <div class="hdr-player hdr-black">
           <span class="hdr-count" id="black-remaining">15</span>
           <span class="hdr-chip black"></span>
@@ -50,6 +65,9 @@
         </div>
         <div class="midbar">
           <div class="midbar-label" id="midbar-label"></div>
+          <button class="cube hidden" id="cube" data-action="double" type="button" tabindex="-1">
+            <span class="cube-value" id="cube-value">1</span>
+          </button>
         </div>
         <div class="row row-bot" id="row-bot">
           <div class="half half-left" id="row-bot-left"></div>
@@ -66,9 +84,12 @@
         </div>
         <div class="action-buttons" id="action-buttons">
           <button class="action-btn primary focusable" id="roll-btn" data-action="roll" data-zone="action" data-idx="0">Roll Dice</button>
-          <button class="action-btn focusable hidden" id="undo-btn" data-action="undo" data-zone="action" data-idx="1">Undo</button>
-          <button class="action-btn focusable hidden" id="end-btn" data-action="end-turn" data-zone="action" data-idx="2">End Turn</button>
-          <button class="action-btn focusable hidden" id="bear-btn" data-action="bear-off" data-zone="action" data-idx="3">Bear Off</button>
+          <button class="action-btn focusable hidden" id="double-btn" data-action="double" data-zone="action" data-idx="1">Double</button>
+          <button class="action-btn focusable hidden" id="accept-btn" data-action="accept-double" data-zone="action" data-idx="2">Accept</button>
+          <button class="action-btn focusable hidden" id="decline-btn" data-action="decline-double" data-zone="action" data-idx="3">Decline</button>
+          <button class="action-btn focusable hidden" id="undo-btn" data-action="undo" data-zone="action" data-idx="4">Undo</button>
+          <button class="action-btn focusable hidden" id="end-btn" data-action="end-turn" data-zone="action" data-idx="5">End Turn</button>
+          <button class="action-btn focusable hidden" id="bear-btn" data-action="bear-off" data-zone="action" data-idx="6">Bear Off</button>
         </div>
       </div>
     </div>
@@ -79,6 +100,16 @@
         <h1 class="home-title" id="winner-title">You win!</h1>
         <p class="home-sub" id="winner-sub"></p>
         <button class="primary-btn focusable" data-action="new-game">Play Again</button>
+        <button class="secondary-btn focusable" data-action="home">Home</button>
+      </div>
+    </div>
+
+    <div id="matchover" class="screen hidden">
+      <div class="home-content">
+        <div class="winner-emblem" id="match-winner-emblem"></div>
+        <h1 class="home-title" id="match-winner-title">Match won</h1>
+        <p class="home-sub" id="match-winner-sub"></p>
+        <button class="primary-btn focusable" data-action="new-game">New Match</button>
         <button class="secondary-btn focusable" data-action="home">Home</button>
       </div>
     </div>

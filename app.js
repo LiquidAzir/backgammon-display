@@ -16,11 +16,25 @@
     currentScreen: 'home',
     screenHistory: [],
     game: null,
+    match: null,
     snapshot: null,
     aiBusy: false,
   };
 
   var screens = {};
+
+  function newMatchState(length) {
+    // length is the "best of N" games — match is decided when a player
+    // reaches ceil(N/2) match points (cube value × game wins).
+    var target = Math.max(1, Math.ceil(length / 2));
+    return {
+      length: length,
+      target: target,
+      scoreW: 0,
+      scoreB: 0,
+      gameNumber: 1,
+    };
+  }
 
   // =================== GAME MODEL ===================
   function createInitialBoard() {
@@ -49,6 +63,10 @@
       legalDests: [],
       phase: 'need-roll',
       winner: null,
+      // Doubling cube. owner === null means centered (either player can offer).
+      cube: { value: 1, owner: null },
+      // While a double is being negotiated.
+      cubeOffer: null,  // null OR { by: 'w'|'b', value: <new value> }
     };
   }
 
@@ -65,7 +83,11 @@
     if (state.aiBusy) return;
     if (state.game.winner) { clearSavedGame(); return; }
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(state.game));
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({
+        version: 2,
+        game: state.game,
+        match: state.match,
+      }));
     } catch (e) {
       // quota or disabled — silently ignore
     }
@@ -75,11 +97,22 @@
     try {
       var raw = localStorage.getItem(STORAGE_KEY);
       if (!raw) return null;
-      var g = JSON.parse(raw);
-      // Basic shape validation — anything off, treat as no save
+      var parsed = JSON.parse(raw);
+      var g, m;
+      if (parsed && parsed.version === 2 && parsed.game) {
+        g = parsed.game;
+        m = parsed.match || newMatchState(1);
+      } else {
+        // v1 save (no envelope, no match/cube) — migrate.
+        g = parsed;
+        m = newMatchState(1);
+      }
       if (!g || !Array.isArray(g.board) || g.board.length !== 24) return null;
       if (g.winner) return null;
-      return g;
+      // Backfill cube fields if loading from older save shape.
+      if (!g.cube) g.cube = { value: 1, owner: null };
+      if (g.cubeOffer === undefined) g.cubeOffer = null;
+      return { game: g, match: m };
     } catch (e) {
       return null;
     }
@@ -251,6 +284,32 @@
     return null;
   }
 
+  function pipCount(g, color) {
+    // Sum of pip-distances all of `color`'s checkers still need to bear off.
+    // Lower = better position. Used by the AI for cube decisions.
+    var n = 0;
+    n += g.bar[color] * (color === COLOR_W ? 25 : 25); // bar = 25 pips
+    for (var i = 0; i < 24; i++) {
+      var c = g.board[i];
+      if (c && c.color === color) {
+        n += c.count * bearOffDistance(color, i);
+      }
+    }
+    return n;
+  }
+
+  function canOfferDouble(g, color) {
+    // Standard rule: cube can only be offered at the start of your turn,
+    // before rolling. The cube must be centered or owned by you.
+    if (g.winner) return false;
+    if (g.cubeOffer) return false;
+    if (g.turn !== color) return false;
+    if (g.phase !== 'need-roll') return false;
+    if (g.cube.value >= 64) return false;
+    if (g.cube.owner !== null && g.cube.owner !== color) return false;
+    return true;
+  }
+
   // =================== AI ===================
   function blotVulnerability(g, point, color) {
     var opp = color === COLOR_W ? COLOR_B : COLOR_W;
@@ -323,6 +382,33 @@
       if (s > bestScore) { bestScore = s; best = moves[i]; }
     }
     return best;
+  }
+
+  // ---------- Cube AI ----------
+  function aiShouldOfferDouble(g) {
+    if (!canOfferDouble(g, COLOR_B)) return false;
+    // Don't offer at cube 1 in the very first move sequence — wait until
+    // we're actually ahead. Need pip-count differential in our favor.
+    var myPips = pipCount(g, COLOR_B);
+    var theirPips = pipCount(g, COLOR_W);
+    var diff = theirPips - myPips;   // positive = we're ahead
+    // Heuristic: offer if at least 20 pips ahead. Don't keep escalating
+    // past 16 unless very far ahead (avoid runaway cube vs human).
+    if (g.cube.value >= 16 && diff < 50) return false;
+    if (g.cube.value >= 8  && diff < 35) return false;
+    return diff >= 20;
+  }
+
+  function aiShouldAcceptDouble(g) {
+    // We must respond to the human's offer.
+    var myPips = pipCount(g, COLOR_B);
+    var theirPips = pipCount(g, COLOR_W);
+    var diff = myPips - theirPips;  // positive = we're behind
+    // Drop (decline) only if very clearly losing AND cube already painful.
+    var newValue = g.cubeOffer ? g.cubeOffer.value : g.cube.value * 2;
+    if (diff > 40 && newValue >= 4) return false;
+    if (diff > 70) return false;
+    return true;
   }
 
   // =================== RENDERING ===================
@@ -474,6 +560,9 @@
   function renderActions() {
     var g = state.game;
     var roll = document.getElementById('roll-btn');
+    var dbl = document.getElementById('double-btn');
+    var accept = document.getElementById('accept-btn');
+    var decline = document.getElementById('decline-btn');
     var undo = document.getElementById('undo-btn');
     var end = document.getElementById('end-btn');
     var bear = document.getElementById('bear-btn');
@@ -488,18 +577,31 @@
 
     var human = g.turn === COLOR_W && !state.aiBusy && !g.winner;
 
-    setBtn(roll, human && g.phase === 'need-roll', human && g.phase === 'need-roll', false);
+    // When AI has offered a double, the player must respond first —
+    // hide every other action until they Accept or Decline.
+    var awaitingResponse = g.cubeOffer !== null && g.cubeOffer.by === COLOR_B;
+    var ourOfferPending  = g.cubeOffer !== null && g.cubeOffer.by === COLOR_W;
 
-    var canUndo = human && state.snapshot && g.phase !== 'need-roll' && !g.winner;
+    setBtn(accept, awaitingResponse, awaitingResponse, false);
+    setBtn(decline, awaitingResponse, awaitingResponse, false);
+    if (awaitingResponse) accept.classList.add('accept'); else accept.classList.remove('accept');
+    if (awaitingResponse) decline.classList.add('decline'); else decline.classList.remove('decline');
+
+    var showRoll = human && g.phase === 'need-roll' && !g.cubeOffer;
+    setBtn(roll, showRoll, showRoll, false);
+
+    var showDouble = canOfferDouble(g, COLOR_W) && !state.aiBusy && !ourOfferPending;
+    setBtn(dbl, showDouble, showDouble, false);
+
+    var canUndo = human && state.snapshot && g.phase !== 'need-roll' && !g.winner && !g.cubeOffer;
     setBtn(undo, !!canUndo, !!canUndo, false);
 
-    // End-turn button only when player has dice remaining but no possible moves
     var stuck = human && g.phase === 'need-move' && g.diceRemaining.length > 0
-                && allLegalMoves(g).length === 0;
+                && allLegalMoves(g).length === 0 && !g.cubeOffer;
     setBtn(end, !!stuck, !!stuck, false);
 
     var canBear = false;
-    if (g.selected !== null && human) {
+    if (g.selected !== null && human && !g.cubeOffer) {
       canBear = g.legalDests.some(function (m) { return m.to === 'off'; });
     }
     setBtn(bear, canBear, canBear, canBear);
@@ -514,8 +616,49 @@
   function renderMidbarLabel() {
     var g = state.game;
     var label = document.getElementById('midbar-label');
+    // Hide the turn label whenever we're showing the cube — keeps the
+    // midbar uncluttered.
     if (g.winner) { label.textContent = ''; return; }
     label.textContent = g.turn === COLOR_W ? 'WHITE' : 'BLACK';
+  }
+
+  function renderCube() {
+    var g = state.game;
+    var cubeEl = document.getElementById('cube');
+    var valEl = document.getElementById('cube-value');
+    if (!cubeEl) return;
+
+    // Hide cube entirely until either it's been used or a double is being
+    // negotiated — keeps a clean board for first turn.
+    var show = g.cube.value > 1 || g.cube.owner !== null || g.cubeOffer !== null;
+    cubeEl.classList.toggle('hidden', !show);
+    if (!show) {
+      cubeEl.classList.remove('focusable', 'owner-w', 'owner-b', 'offered');
+      cubeEl.setAttribute('tabindex', '-1');
+      valEl.textContent = g.cube.value;
+      return;
+    }
+
+    var displayValue = g.cubeOffer ? g.cubeOffer.value : g.cube.value;
+    valEl.textContent = displayValue;
+
+    cubeEl.classList.remove('owner-w', 'owner-b', 'offered');
+    if (g.cube.owner === COLOR_W) cubeEl.classList.add('owner-w');
+    else if (g.cube.owner === COLOR_B) cubeEl.classList.add('owner-b');
+    if (g.cubeOffer) cubeEl.classList.add('offered');
+    // Cube is mouse-clickable but not in D-pad nav — Double button covers that.
+    cubeEl.setAttribute('tabindex', '-1');
+  }
+
+  function renderMatchScore() {
+    var el = document.getElementById('match-score');
+    if (!el) return;
+    if (!state.match || state.match.length === 1) {
+      el.textContent = '';
+      return;
+    }
+    el.textContent = 'Match ' + state.match.scoreW + ' – ' + state.match.scoreB +
+                     ' (to ' + state.match.target + ')';
   }
 
   function renderStatus() {
@@ -525,9 +668,21 @@
       st.textContent = g.winner === COLOR_W ? 'You win!' : 'Computer wins';
       return;
     }
+    if (g.cubeOffer && g.cubeOffer.by === COLOR_B) {
+      st.textContent = 'Computer offers ' + g.cubeOffer.value + ' — accept?';
+      return;
+    }
+    if (g.cubeOffer && g.cubeOffer.by === COLOR_W) {
+      st.textContent = 'Computer is deciding…';
+      return;
+    }
     if (state.aiBusy) { st.textContent = 'Computer thinking…'; return; }
     if (g.turn === COLOR_W) {
-      if (g.phase === 'need-roll') st.textContent = 'Your turn — roll the dice';
+      if (g.phase === 'need-roll') {
+        st.textContent = canOfferDouble(g, COLOR_W)
+          ? 'Your turn — roll or double'
+          : 'Your turn — roll the dice';
+      }
       else if (g.bar.w > 0) st.textContent = 'Enter from the bar';
       else if (g.selected !== null) st.textContent = 'Choose a destination';
       else st.textContent = 'Choose a checker to move';
@@ -546,6 +701,8 @@
     renderActions();
     renderStatus();
     renderMidbarLabel();
+    renderCube();
+    renderMatchScore();
   }
 
   // =================== TOAST ===================
@@ -718,11 +875,30 @@
 
   // =================== ACTIONS / FLOW ===================
   function startNewGame() {
+    // "New game" — go to match-setup so user can pick length.
+    state.snapshot = null;
+    state.aiBusy = false;
+    navigateTo('match-setup', { addToHistory: false });
+  }
+
+  function startMatch(length) {
+    state.match = newMatchState(length);
     state.game = newGameState();
     state.snapshot = null;
     state.aiBusy = false;
     saveGame();
-    navigateTo('game', { addToHistory: state.currentScreen === 'home' });
+    navigateTo('game', { addToHistory: false });
+    renderGame();
+    setTimeout(focusFirstActionable, 80);
+  }
+
+  function startNextGameInMatch() {
+    if (!state.match) return;
+    state.match.gameNumber++;
+    state.game = newGameState();
+    state.snapshot = null;
+    state.aiBusy = false;
+    saveGame();
     renderGame();
     setTimeout(focusFirstActionable, 80);
   }
@@ -730,7 +906,8 @@
   function continueSavedGame() {
     var saved = loadSavedGame();
     if (!saved) return;
-    state.game = saved;
+    state.game = saved.game;
+    state.match = saved.match;
     state.snapshot = null;
     state.aiBusy = false;
     navigateTo('game', { addToHistory: state.currentScreen === 'home' });
@@ -795,11 +972,8 @@
     g.legalDests = [];
     var w = gameWinner(g);
     if (w) {
-      g.winner = w;
-      g.phase = 'gameover';
-      clearSavedGame();
       renderGame();
-      setTimeout(showGameOver, 900);
+      setTimeout(function () { onGameEnd(w); }, 500);
       return;
     }
     saveGame();
@@ -858,26 +1032,106 @@
     g.phase = 'need-roll';
     state.snapshot = null;
     renderGame();
-    setTimeout(aiTurn, 600);
+    setTimeout(aiTurnStart, 600);
   }
 
-  function aiTurn() {
+  // AI's turn begins with the cube decision. If we offer, control passes
+  // back to the player to Accept/Decline; if we don't (or after accept),
+  // aiTurnRoll() is called to actually play the turn.
+  function aiTurnStart() {
     var g = state.game;
     if (!g || g.winner) return;
     state.aiBusy = true;
     renderGame();
     setTimeout(function () {
-      rollDice();
-      renderGame();
-      setTimeout(function () {
-        if (allLegalMoves(g).length === 0) {
-          showToast('Computer has no moves');
-          setTimeout(endAiTurn, 900);
-          return;
-        }
-        playAiMoves();
-      }, AI_ROLL_DELAY);
+      if (aiShouldOfferDouble(g)) {
+        aiOfferDouble();
+      } else {
+        aiTurnRoll();
+      }
     }, 300);
+  }
+
+  function aiOfferDouble() {
+    var g = state.game;
+    var newValue = g.cube.value * 2;
+    if (newValue > 64) { aiTurnRoll(); return; }
+    g.cubeOffer = { by: COLOR_B, value: newValue };
+    state.aiBusy = false; // yield to player to respond
+    saveGame();
+    renderGame();
+    setTimeout(focusFirstActionable, 30);
+  }
+
+  function aiTurnRoll() {
+    var g = state.game;
+    state.aiBusy = true;
+    renderGame();
+    rollDice();
+    renderGame();
+    setTimeout(function () {
+      if (allLegalMoves(g).length === 0) {
+        showToast('Computer has no moves');
+        setTimeout(endAiTurn, 900);
+        return;
+      }
+      playAiMoves();
+    }, AI_ROLL_DELAY);
+  }
+
+  // ---------- Cube handlers ----------
+  function handleDouble() {
+    var g = state.game;
+    if (!g || state.aiBusy || !canOfferDouble(g, COLOR_W)) return;
+    var newValue = g.cube.value * 2;
+    if (newValue > 64) return;
+    g.cubeOffer = { by: COLOR_W, value: newValue };
+    state.aiBusy = true;
+    saveGame();
+    renderGame();
+    setTimeout(aiRespondToDouble, 800);
+  }
+
+  function aiRespondToDouble() {
+    var g = state.game;
+    if (!g || !g.cubeOffer || g.cubeOffer.by !== COLOR_W) return;
+    if (aiShouldAcceptDouble(g)) {
+      g.cube.value = g.cubeOffer.value;
+      g.cube.owner = COLOR_B;
+      g.cubeOffer = null;
+      state.aiBusy = false;
+      showToast('Computer accepts');
+      saveGame();
+      renderGame();
+      setTimeout(focusFirstActionable, 30);
+    } else {
+      // Decline — player wins this game at the OLD cube value.
+      showToast('Computer declines — you win this game');
+      g.cubeOffer = null;
+      state.aiBusy = false;
+      setTimeout(function () { onGameEnd(COLOR_W); }, 700);
+    }
+  }
+
+  function handleAcceptDouble() {
+    var g = state.game;
+    if (!g || !g.cubeOffer || g.cubeOffer.by !== COLOR_B) return;
+    g.cube.value = g.cubeOffer.value;
+    g.cube.owner = COLOR_W;
+    g.cubeOffer = null;
+    showToast('You accept');
+    saveGame();
+    renderGame();
+    // AI was about to roll — continue AI's turn.
+    setTimeout(aiTurnRoll, 500);
+  }
+
+  function handleDeclineDouble() {
+    var g = state.game;
+    if (!g || !g.cubeOffer || g.cubeOffer.by !== COLOR_B) return;
+    showToast('You decline');
+    g.cubeOffer = null;
+    setTimeout(function () { onGameEnd(COLOR_B); }, 700);
   }
 
   function playAiMoves() {
@@ -896,14 +1150,11 @@
         g.legalDests = [];
         var w = gameWinner(g);
         if (w) {
-          g.winner = w;
-          g.phase = 'gameover';
-          clearSavedGame();
           renderGame();
           setTimeout(function () {
             state.aiBusy = false;
-            showGameOver();
-          }, 900);
+            onGameEnd(w);
+          }, 700);
           return;
         }
         renderGame();
@@ -930,17 +1181,50 @@
     setTimeout(focusFirstActionable, 30);
   }
 
-  function showGameOver() {
+  function onGameEnd(winnerColor) {
     var g = state.game;
-    var emb = document.getElementById('winner-emblem');
-    var title = document.getElementById('winner-title');
-    var sub = document.getElementById('winner-sub');
-    var w = g.winner;
-    emb.className = 'winner-emblem ' + w;
-    emb.textContent = w === COLOR_W ? '♕' : '♛';
-    title.textContent = w === COLOR_W ? 'You win!' : 'Computer wins';
-    sub.textContent = w === COLOR_W ? 'Nicely played.' : 'Try again?';
-    navigateTo('gameover');
+    if (!g || g.winner) return;
+    g.winner = winnerColor;
+    g.phase = 'gameover';
+    if (!state.match) state.match = newMatchState(1);
+    var points = g.cube.value;
+    if (winnerColor === COLOR_W) state.match.scoreW += points;
+    else state.match.scoreB += points;
+    clearSavedGame();
+    state.aiBusy = false;
+    renderGame();
+
+    var matchOver = state.match.scoreW >= state.match.target ||
+                    state.match.scoreB >= state.match.target;
+
+    if (matchOver) {
+      setTimeout(showMatchOver, 900);
+    } else {
+      var who = winnerColor === COLOR_W ? 'You' : 'Computer';
+      showToast(who + ' win' + (winnerColor === COLOR_W ? '' : 's') +
+                ' game ' + state.match.gameNumber +
+                ' (+' + points + ')');
+      setTimeout(startNextGameInMatch, 2200);
+    }
+  }
+
+  function showMatchOver() {
+    var m = state.match;
+    var winner = m.scoreW >= m.target ? COLOR_W : COLOR_B;
+    var single = m.length === 1;
+    var emb = document.getElementById('match-winner-emblem');
+    var title = document.getElementById('match-winner-title');
+    var sub = document.getElementById('match-winner-sub');
+    emb.className = 'winner-emblem ' + winner;
+    emb.textContent = winner === COLOR_W ? '♕' : '♛';
+    if (single) {
+      title.textContent = winner === COLOR_W ? 'You win!' : 'Computer wins';
+      sub.textContent = '';
+    } else {
+      title.textContent = winner === COLOR_W ? 'Match won!' : 'Computer wins the match';
+      sub.textContent = 'Final score: ' + m.scoreW + ' – ' + m.scoreB;
+    }
+    navigateTo('matchover');
   }
 
   // =================== EVENT WIRING ===================
@@ -948,12 +1232,19 @@
     switch (action) {
       case 'new-game': startNewGame(); break;
       case 'continue': continueSavedGame(); break;
+      case 'match-1': startMatch(1); break;
+      case 'match-3': startMatch(3); break;
+      case 'match-5': startMatch(5); break;
+      case 'match-7': startMatch(7); break;
       case 'home':
         state.screenHistory = [];
         navigateTo('home', { addToHistory: false });
         break;
       case 'back': navigateBack(); break;
       case 'roll': handleRoll(); break;
+      case 'double': handleDouble(); break;
+      case 'accept-double': handleAcceptDouble(); break;
+      case 'decline-double': handleDeclineDouble(); break;
       case 'undo': handleUndo(); break;
       case 'end-turn': endHumanTurn(); break;
       case 'bear-off': handleBearOff(); break;

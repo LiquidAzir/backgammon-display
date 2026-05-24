@@ -27,9 +27,27 @@
     </div>
 
     <div id="match-setup" class="screen hidden">
-      <div class="home-content">
-        <h1 class="home-title small">Match length</h1>
-        <p class="home-sub" id="setup-sub">Choose how many games to play</p>
+      <div class="home-content compact">
+        <h1 class="home-title small">New match</h1>
+
+        <div class="setup-row">
+          <span class="setup-label">Computer</span>
+          <div class="chip-group" id="difficulty-group">
+            <button class="chip focusable" data-difficulty="easy">Easy</button>
+            <button class="chip focusable active" data-difficulty="normal">Normal</button>
+            <button class="chip focusable" data-difficulty="hard">Hard</button>
+          </div>
+        </div>
+
+        <div class="setup-row">
+          <span class="setup-label">Sound</span>
+          <div class="chip-group" id="sound-group">
+            <button class="chip focusable active" data-sound="on">On</button>
+            <button class="chip focusable" data-sound="off">Off</button>
+          </div>
+        </div>
+
+        <span class="setup-label">Match length</span>
         <button class="primary-btn focusable" data-action="match-1">Single Game</button>
         <button class="primary-btn focusable" data-action="match-3">Best of 3</button>
         <button class="primary-btn focusable" data-action="match-5">Best of 5</button>

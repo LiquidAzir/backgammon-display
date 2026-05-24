@@ -10,6 +10,8 @@
   var AI_MOVE_DELAY = 500;
   var END_TURN_DELAY = 700;
   var STORAGE_KEY = 'mdg_backgammon';
+  var SETTINGS_KEY = 'mdg_backgammon_settings';
+  var DEFAULT_SETTINGS = { difficulty: 'normal', soundOn: true };
 
   // =================== STATE ===================
   var state = {
@@ -19,17 +21,47 @@
     match: null,
     snapshot: null,
     aiBusy: false,
+    animating: false,
+    settings: null,  // loaded from localStorage on init
   };
 
   var screens = {};
 
-  function newMatchState(length) {
+  function loadSettings() {
+    try {
+      var raw = localStorage.getItem(SETTINGS_KEY);
+      var s = raw ? JSON.parse(raw) : {};
+      return {
+        difficulty: ['easy', 'normal', 'hard'].indexOf(s.difficulty) >= 0
+                    ? s.difficulty : DEFAULT_SETTINGS.difficulty,
+        soundOn: typeof s.soundOn === 'boolean' ? s.soundOn : DEFAULT_SETTINGS.soundOn,
+      };
+    } catch (e) {
+      return Object.assign({}, DEFAULT_SETTINGS);
+    }
+  }
+
+  function saveSettings() {
+    try {
+      localStorage.setItem(SETTINGS_KEY, JSON.stringify(state.settings));
+    } catch (e) {}
+  }
+
+  function getDifficulty() {
+    // Mid-match difficulty wins over the global setting so a resumed match
+    // keeps the level it was started at.
+    if (state.match && state.match.difficulty) return state.match.difficulty;
+    return (state.settings && state.settings.difficulty) || 'normal';
+  }
+
+  function newMatchState(length, difficulty) {
     // length is the "best of N" games — match is decided when a player
     // reaches ceil(N/2) match points (cube value × game wins).
     var target = Math.max(1, Math.ceil(length / 2));
     return {
       length: length,
       target: target,
+      difficulty: difficulty || (state.settings && state.settings.difficulty) || 'normal',
       scoreW: 0,
       scoreB: 0,
       gameNumber: 1,
@@ -284,6 +316,23 @@
     return null;
   }
 
+  // Standard rules:
+  //   1 — normal win (loser has borne off >= 1 checker)
+  //   2 — gammon  (loser has borne off zero)
+  //   3 — backgammon (loser has borne off zero AND has a checker on the
+  //                   bar OR a checker in the winner's home board)
+  function gameWinMultiplier(g, winnerColor) {
+    var loser = winnerColor === COLOR_W ? COLOR_B : COLOR_W;
+    if (g.off[loser] > 0) return 1;
+    if (g.bar[loser] > 0) return 3;
+    var lo = winnerColor === COLOR_W ? 0 : 18;
+    var hi = winnerColor === COLOR_W ? 5 : 23;
+    for (var i = lo; i <= hi; i++) {
+      if (g.board[i] && g.board[i].color === loser) return 3;
+    }
+    return 2;
+  }
+
   function pipCount(g, color) {
     // Sum of pip-distances all of `color`'s checkers still need to bear off.
     // Lower = better position. Used by the AI for cube decisions.
@@ -372,9 +421,7 @@
     return score;
   }
 
-  function aiPickBestMove(g) {
-    var moves = allLegalMoves(g);
-    if (moves.length === 0) return null;
+  function greedyBestMove(g, moves) {
     var best = moves[0];
     var bestScore = aiScoreMove(g, moves[0]);
     for (var i = 1; i < moves.length; i++) {
@@ -384,30 +431,80 @@
     return best;
   }
 
+  // For each candidate FIRST move, simulate playing the rest of the dice
+  // greedily, and pick the first move that yields the highest total score.
+  // This is a 1-step lookahead — modest cost, meaningful strength bump.
+  function hardBestMove(g) {
+    var firstMoves = allLegalMoves(g);
+    if (firstMoves.length === 0) return null;
+    if (firstMoves.length === 1) return firstMoves[0];
+
+    var best = firstMoves[0];
+    var bestScore = -Infinity;
+
+    for (var i = 0; i < firstMoves.length; i++) {
+      var move = firstMoves[i];
+      var sim = deepClone(g);
+      var score = aiScoreMove(sim, move);
+      makeMove(sim, move);
+      // Greedy-simulate remaining dice.
+      var guard = 6;  // sanity cap (max 4 doubles)
+      while (sim.diceRemaining.length > 0 && guard-- > 0) {
+        var simMoves = allLegalMoves(sim);
+        if (simMoves.length === 0) break;
+        var step = greedyBestMove(sim, simMoves);
+        score += aiScoreMove(sim, step);
+        makeMove(sim, step);
+      }
+      if (score > bestScore) { bestScore = score; best = move; }
+    }
+    return best;
+  }
+
+  function aiPickBestMove(g) {
+    var moves = allLegalMoves(g);
+    if (moves.length === 0) return null;
+    var diff = getDifficulty();
+    if (diff === 'easy') {
+      // Random legal move. Predictable weakness — easy to beat.
+      return moves[Math.floor(Math.random() * moves.length)];
+    }
+    if (diff === 'hard') {
+      return hardBestMove(g);
+    }
+    return greedyBestMove(g, moves);
+  }
+
   // ---------- Cube AI ----------
   function aiShouldOfferDouble(g) {
     if (!canOfferDouble(g, COLOR_B)) return false;
-    // Don't offer at cube 1 in the very first move sequence — wait until
-    // we're actually ahead. Need pip-count differential in our favor.
+    var diff = getDifficulty();
+    if (diff === 'easy') return false;  // easy AI never doubles
     var myPips = pipCount(g, COLOR_B);
     var theirPips = pipCount(g, COLOR_W);
-    var diff = theirPips - myPips;   // positive = we're ahead
-    // Heuristic: offer if at least 20 pips ahead. Don't keep escalating
-    // past 16 unless very far ahead (avoid runaway cube vs human).
-    if (g.cube.value >= 16 && diff < 50) return false;
-    if (g.cube.value >= 8  && diff < 35) return false;
-    return diff >= 20;
+    var pipDiff = theirPips - myPips;   // positive = we're ahead
+    // Hard plays the cube more aggressively (lower threshold to offer,
+    // willing to push to higher cube values).
+    var threshold = diff === 'hard' ? 14 : 20;
+    var bigCubeThreshold8 = diff === 'hard' ? 25 : 35;
+    var bigCubeThreshold16 = diff === 'hard' ? 40 : 50;
+    if (g.cube.value >= 16 && pipDiff < bigCubeThreshold16) return false;
+    if (g.cube.value >= 8  && pipDiff < bigCubeThreshold8) return false;
+    return pipDiff >= threshold;
   }
 
   function aiShouldAcceptDouble(g) {
-    // We must respond to the human's offer.
+    var diff = getDifficulty();
+    if (diff === 'easy') return true;  // easy AI always accepts (over-takes)
     var myPips = pipCount(g, COLOR_B);
     var theirPips = pipCount(g, COLOR_W);
-    var diff = myPips - theirPips;  // positive = we're behind
-    // Drop (decline) only if very clearly losing AND cube already painful.
+    var pipDiff = myPips - theirPips;  // positive = we're behind
     var newValue = g.cubeOffer ? g.cubeOffer.value : g.cube.value * 2;
-    if (diff > 40 && newValue >= 4) return false;
-    if (diff > 70) return false;
+    // Hard drops earlier when clearly losing (preserves match equity).
+    var bigDropThreshold = diff === 'hard' ? 30 : 40;
+    var hardDropThreshold = diff === 'hard' ? 55 : 70;
+    if (pipDiff > bigDropThreshold && newValue >= 4) return false;
+    if (pipDiff > hardDropThreshold) return false;
     return true;
   }
 
@@ -705,6 +802,147 @@
     renderMatchScore();
   }
 
+  // =================== SOUND ===================
+  // All sounds are synthesized via Web Audio — zero asset weight, no
+  // network requests, plays anywhere. Lazy-inits the AudioContext on the
+  // first call (autoplay policies require a user gesture to start audio).
+  var audioCtx = null;
+
+  function getAudioCtx() {
+    if (audioCtx) return audioCtx;
+    try {
+      var Ctor = window.AudioContext || window.webkitAudioContext;
+      if (!Ctor) return null;
+      audioCtx = new Ctor();
+    } catch (e) {
+      audioCtx = null;
+    }
+    return audioCtx;
+  }
+
+  function isSoundOn() {
+    return !!(state.settings && state.settings.soundOn !== false);
+  }
+
+  function playSound(type) {
+    if (!isSoundOn()) return;
+    var ctx = getAudioCtx();
+    if (!ctx) return;
+    if (ctx.state === 'suspended') {
+      try { ctx.resume(); } catch (e) {}
+    }
+    try {
+      switch (type) {
+        case 'roll':  sndRoll(ctx); break;
+        case 'move':  sndClick(ctx, 500, 0.05, 0.12); break;
+        case 'hit':   sndHit(ctx); break;
+        case 'cube':  sndCube(ctx); break;
+        case 'win':   sndWin(ctx); break;
+        case 'lose':  sndLose(ctx); break;
+      }
+    } catch (e) {
+      // Never let a sound failure crash gameplay.
+    }
+  }
+
+  function sndClick(ctx, freq, dur, vol) {
+    var osc = ctx.createOscillator();
+    var gain = ctx.createGain();
+    osc.type = 'square';
+    osc.frequency.value = freq;
+    var t = ctx.currentTime;
+    gain.gain.setValueAtTime(0.0001, t);
+    gain.gain.exponentialRampToValueAtTime(vol || 0.15, t + 0.005);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    osc.connect(gain).connect(ctx.destination);
+    osc.start();
+    osc.stop(t + dur + 0.02);
+  }
+
+  function sndRoll(ctx) {
+    // Brief noise burst (dice tumble) then a couple of clicks (settle).
+    var dur = 0.22;
+    var buf = ctx.createBuffer(1, Math.floor(dur * ctx.sampleRate), ctx.sampleRate);
+    var data = buf.getChannelData(0);
+    for (var i = 0; i < data.length; i++) {
+      var t = i / ctx.sampleRate;
+      data[i] = (Math.random() * 2 - 1) * Math.exp(-t * 14) * 0.35;
+    }
+    var src = ctx.createBufferSource();
+    src.buffer = buf;
+    var hp = ctx.createBiquadFilter();
+    hp.type = 'highpass';
+    hp.frequency.value = 800;
+    src.connect(hp).connect(ctx.destination);
+    src.start();
+    setTimeout(function () { sndClick(ctx, 420, 0.04, 0.12); }, 200);
+    setTimeout(function () { sndClick(ctx, 360, 0.05, 0.10); }, 270);
+  }
+
+  function sndHit(ctx) {
+    var osc = ctx.createOscillator();
+    var gain = ctx.createGain();
+    osc.type = 'sine';
+    var t = ctx.currentTime;
+    osc.frequency.setValueAtTime(220, t);
+    osc.frequency.exponentialRampToValueAtTime(80, t + 0.18);
+    gain.gain.setValueAtTime(0.0001, t);
+    gain.gain.exponentialRampToValueAtTime(0.35, t + 0.005);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.22);
+    osc.connect(gain).connect(ctx.destination);
+    osc.start();
+    osc.stop(t + 0.24);
+  }
+
+  function sndCube(ctx) {
+    var osc = ctx.createOscillator();
+    var gain = ctx.createGain();
+    osc.type = 'triangle';
+    var t = ctx.currentTime;
+    osc.frequency.setValueAtTime(320, t);
+    osc.frequency.linearRampToValueAtTime(720, t + 0.2);
+    gain.gain.setValueAtTime(0.0001, t);
+    gain.gain.linearRampToValueAtTime(0.2, t + 0.04);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.28);
+    osc.connect(gain).connect(ctx.destination);
+    osc.start();
+    osc.stop(t + 0.32);
+  }
+
+  function sndWin(ctx) {
+    // C major arpeggio
+    [262, 330, 392, 523].forEach(function (freq, idx) {
+      var osc = ctx.createOscillator();
+      var gain = ctx.createGain();
+      osc.type = 'triangle';
+      var t0 = ctx.currentTime + idx * 0.13;
+      osc.frequency.value = freq;
+      gain.gain.setValueAtTime(0.0001, t0);
+      gain.gain.exponentialRampToValueAtTime(0.22, t0 + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.3);
+      osc.connect(gain).connect(ctx.destination);
+      osc.start(t0);
+      osc.stop(t0 + 0.32);
+    });
+  }
+
+  function sndLose(ctx) {
+    // Descending two-note (E -> C)
+    [330, 262].forEach(function (freq, idx) {
+      var osc = ctx.createOscillator();
+      var gain = ctx.createGain();
+      osc.type = 'triangle';
+      var t0 = ctx.currentTime + idx * 0.22;
+      osc.frequency.value = freq;
+      gain.gain.setValueAtTime(0.0001, t0);
+      gain.gain.exponentialRampToValueAtTime(0.18, t0 + 0.04);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.35);
+      osc.connect(gain).connect(ctx.destination);
+      osc.start(t0);
+      osc.stop(t0 + 0.38);
+    });
+  }
+
   // =================== TOAST ===================
   function showToast(msg) {
     var toast = document.getElementById('toast');
@@ -737,6 +975,7 @@
       screens[id].classList.remove('hidden');
       state.currentScreen = id;
       if (id === 'home') updateHomeButtons();
+      if (id === 'match-setup') syncSetupChips();
       setTimeout(function () { focusFirstActionable(); }, 50);
     }
   }
@@ -873,6 +1112,144 @@
     else genericMoveFocus(direction);
   }
 
+  // =================== ANIMATION ===================
+  var MOVE_ANIM_MS = 260;
+
+  function getElementCenter(el) {
+    var r = el.getBoundingClientRect();
+    return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+  }
+
+  function getTopCheckerEl(idx) {
+    var pt = document.querySelector('[data-pt="' + idx + '"]');
+    if (!pt) return null;
+    var stack = pt.querySelector('.checker-stack');
+    if (!stack || !stack.children.length) return null;
+    // The most recently added checker is the LAST child in DOM order
+    // (buildPointHTML appends in a loop).
+    return stack.lastElementChild;
+  }
+
+  function getBarCheckerEl(color) {
+    return document.getElementById('bar-' + color);
+  }
+
+  function getOffPos(color) {
+    var id = color === COLOR_W ? 'white-remaining' : 'black-remaining';
+    var el = document.getElementById(id);
+    if (!el) return { x: 300, y: 22 };
+    return getElementCenter(el);
+  }
+
+  function flipAnimate(el, fromPos, toPos, duration) {
+    return new Promise(function (resolve) {
+      if (!el || !fromPos || !toPos) { resolve(); return; }
+      var dx = fromPos.x - toPos.x;
+      var dy = fromPos.y - toPos.y;
+      if (Math.abs(dx) < 1 && Math.abs(dy) < 1) { resolve(); return; }
+      el.style.transition = 'none';
+      el.style.transform = 'translate(' + dx + 'px, ' + dy + 'px)';
+      el.style.zIndex = '20';
+      // Force reflow so the browser registers the start position.
+      el.offsetHeight;
+      el.style.transition = 'transform ' + (duration || MOVE_ANIM_MS) +
+                            'ms cubic-bezier(0.4, 0, 0.2, 1)';
+      el.style.transform = 'translate(0, 0)';
+      var done = false;
+      function finish() {
+        if (done) return;
+        done = true;
+        // Defensive: element may have been re-rendered out; check before clearing.
+        if (el && el.style) {
+          el.style.transition = '';
+          el.style.transform = '';
+          el.style.zIndex = '';
+        }
+        resolve();
+      }
+      // Belt-and-braces — transitionend isn't always reliable when the
+      // element is removed/replaced mid-animation.
+      setTimeout(finish, (duration || MOVE_ANIM_MS) + 30);
+    });
+  }
+
+  function ghostAnimate(color, fromPos, toPos, duration) {
+    return new Promise(function (resolve) {
+      if (!fromPos || !toPos) { resolve(); return; }
+      var ghost = document.createElement('div');
+      ghost.className = 'ghost-checker ' + color;
+      document.body.appendChild(ghost);
+      ghost.style.left = (fromPos.x - 17) + 'px';
+      ghost.style.top = (fromPos.y - 17) + 'px';
+      ghost.style.transition = 'none';
+      ghost.offsetHeight;
+      ghost.style.transition = 'left ' + duration + 'ms ease-in, top ' +
+                               duration + 'ms ease-in, opacity ' + duration + 'ms ease-in';
+      ghost.style.left = (toPos.x - 17) + 'px';
+      ghost.style.top = (toPos.y - 17) + 'px';
+      ghost.style.opacity = '0.1';
+      setTimeout(function () {
+        if (ghost.parentNode) ghost.parentNode.removeChild(ghost);
+        resolve();
+      }, duration + 30);
+    });
+  }
+
+  // The core: captures positions, mutates state + plays sound, renders,
+  // then animates the moved checker (and any hit checker) into place.
+  // Returns a Promise that resolves once all animations are finished.
+  function animateAndApplyMove(g, move) {
+    return new Promise(function (resolve) {
+      var color = g.turn;
+      var hit = moveWouldHit(g, move);
+
+      // 1. CAPTURE source position from current DOM.
+      var fromPos = null;
+      if (move.from === 'bar') {
+        var be = getBarCheckerEl(color);
+        if (be) fromPos = getElementCenter(be);
+      } else {
+        var src = getTopCheckerEl(move.from);
+        if (src) fromPos = getElementCenter(src);
+      }
+      // For hits, also capture opponent blot position.
+      var hitFromPos = null;
+      if (hit) {
+        var blot = getTopCheckerEl(move.to);
+        if (blot) hitFromPos = getElementCenter(blot);
+      }
+
+      // 2. Mutate state, play sound, clear selection, then render.
+      makeMove(g, move);
+      playSound(hit ? 'hit' : 'move');
+      g.selected = null;
+      g.legalDests = [];
+      renderGame();
+
+      // 3. Animate.
+      var anims = [];
+      if (fromPos) {
+        if (move.to === 'off') {
+          anims.push(ghostAnimate(color, fromPos, getOffPos(color), MOVE_ANIM_MS + 40));
+        } else {
+          var destEl = getTopCheckerEl(move.to);
+          if (destEl) {
+            anims.push(flipAnimate(destEl, fromPos, getElementCenter(destEl)));
+          }
+        }
+      }
+      if (hit && hitFromPos) {
+        var opp = color === COLOR_W ? COLOR_B : COLOR_W;
+        var barEl = getBarCheckerEl(opp);
+        if (barEl) {
+          anims.push(flipAnimate(barEl, hitFromPos, getElementCenter(barEl)));
+        }
+      }
+      if (anims.length === 0) { resolve(); return; }
+      Promise.all(anims).then(function () { resolve(); });
+    });
+  }
+
   // =================== ACTIONS / FLOW ===================
   function startNewGame() {
     // "New game" — go to match-setup so user can pick length.
@@ -882,7 +1259,7 @@
   }
 
   function startMatch(length) {
-    state.match = newMatchState(length);
+    state.match = newMatchState(length, state.settings && state.settings.difficulty);
     state.game = newGameState();
     state.snapshot = null;
     state.aiBusy = false;
@@ -890,6 +1267,18 @@
     navigateTo('game', { addToHistory: false });
     renderGame();
     setTimeout(focusFirstActionable, 80);
+  }
+
+  function syncSetupChips() {
+    var diff = (state.settings && state.settings.difficulty) || 'normal';
+    document.querySelectorAll('[data-difficulty]').forEach(function (c) {
+      c.classList.toggle('active', c.dataset.difficulty === diff);
+    });
+    var soundOn = !state.settings || state.settings.soundOn !== false;
+    document.querySelectorAll('[data-sound]').forEach(function (c) {
+      var on = c.dataset.sound === 'on';
+      c.classList.toggle('active', on === soundOn);
+    });
   }
 
   function startNextGameInMatch() {
@@ -929,6 +1318,14 @@
       g.diceUsed = [false, false];
     }
     g.phase = 'need-move';
+    playSound('roll');
+  }
+
+  // Returns true if applying `move` to `g` would hit an opponent blot.
+  function moveWouldHit(g, move) {
+    if (move.to === 'off' || move.from === undefined) return false;
+    var dest = g.board[move.to];
+    return !!(dest && dest.color !== g.turn && dest.count === 1);
   }
 
   function handleRoll() {
@@ -966,29 +1363,31 @@
 
   function executeMove(move) {
     var g = state.game;
+    if (state.animating) return;
     state.snapshot = deepClone(g);
-    makeMove(g, move);
-    g.selected = null;
-    g.legalDests = [];
-    var w = gameWinner(g);
-    if (w) {
-      renderGame();
-      setTimeout(function () { onGameEnd(w); }, 500);
-      return;
-    }
-    saveGame();
-    renderGame();
-    if (g.diceRemaining.length === 0 || allLegalMoves(g).length === 0) {
-      if (g.diceRemaining.length > 0) showToast('No more moves');
-      setTimeout(endHumanTurn, END_TURN_DELAY);
-    } else {
-      setTimeout(focusFirstActionable, 30);
-    }
+    state.animating = true;
+    // animateAndApplyMove handles: makeMove, playSound, clear selection,
+    // renderGame, then the visual animation. Resolves when animation is done.
+    animateAndApplyMove(g, move).then(function () {
+      state.animating = false;
+      var w = gameWinner(g);
+      if (w) {
+        setTimeout(function () { onGameEnd(w); }, 300);
+        return;
+      }
+      saveGame();
+      if (g.diceRemaining.length === 0 || allLegalMoves(g).length === 0) {
+        if (g.diceRemaining.length > 0) showToast('No more moves');
+        setTimeout(endHumanTurn, END_TURN_DELAY);
+      } else {
+        setTimeout(focusFirstActionable, 30);
+      }
+    });
   }
 
   function handlePointClick(idx) {
     var g = state.game;
-    if (!g || g.turn !== COLOR_W || g.phase !== 'need-move' || state.aiBusy) return;
+    if (!g || g.turn !== COLOR_W || g.phase !== 'need-move' || state.aiBusy || state.animating) return;
     if (g.selected !== null) {
       if (g.selected === idx) { deselect(); return; }
       var move = g.legalDests.find(function (m) { return m.to === idx; });
@@ -999,14 +1398,14 @@
 
   function handleBarClick() {
     var g = state.game;
-    if (!g || g.turn !== COLOR_W || g.phase !== 'need-move' || state.aiBusy) return;
+    if (!g || g.turn !== COLOR_W || g.phase !== 'need-move' || state.aiBusy || state.animating) return;
     if (g.selected === 'bar') { deselect(); return; }
     if (isFocusableBar(g)) selectSource('bar');
   }
 
   function handleBearOff() {
     var g = state.game;
-    if (!g || g.selected === null) return;
+    if (!g || g.selected === null || state.animating) return;
     var move = g.legalDests.find(function (m) { return m.to === 'off'; });
     if (move) executeMove(move);
   }
@@ -1058,6 +1457,7 @@
     if (newValue > 64) { aiTurnRoll(); return; }
     g.cubeOffer = { by: COLOR_B, value: newValue };
     state.aiBusy = false; // yield to player to respond
+    playSound('cube');
     saveGame();
     renderGame();
     setTimeout(focusFirstActionable, 30);
@@ -1087,6 +1487,7 @@
     if (newValue > 64) return;
     g.cubeOffer = { by: COLOR_W, value: newValue };
     state.aiBusy = true;
+    playSound('cube');
     saveGame();
     renderGame();
     setTimeout(aiRespondToDouble, 800);
@@ -1100,6 +1501,7 @@
       g.cube.owner = COLOR_B;
       g.cubeOffer = null;
       state.aiBusy = false;
+      playSound('cube');
       showToast('Computer accepts');
       saveGame();
       renderGame();
@@ -1119,6 +1521,7 @@
     g.cube.value = g.cubeOffer.value;
     g.cube.owner = COLOR_W;
     g.cubeOffer = null;
+    playSound('cube');
     showToast('You accept');
     saveGame();
     renderGame();
@@ -1145,20 +1548,17 @@
       g.legalDests = [move];
       renderGame();
       setTimeout(function () {
-        makeMove(g, move);
-        g.selected = null;
-        g.legalDests = [];
-        var w = gameWinner(g);
-        if (w) {
-          renderGame();
-          setTimeout(function () {
-            state.aiBusy = false;
-            onGameEnd(w);
-          }, 700);
-          return;
-        }
-        renderGame();
-        setTimeout(next, AI_MOVE_DELAY);
+        animateAndApplyMove(g, move).then(function () {
+          var w = gameWinner(g);
+          if (w) {
+            setTimeout(function () {
+              state.aiBusy = false;
+              onGameEnd(w);
+            }, 500);
+            return;
+          }
+          setTimeout(next, AI_MOVE_DELAY - 60);
+        });
       }, AI_SELECT_DELAY);
     }
     next();
@@ -1184,27 +1584,37 @@
   function onGameEnd(winnerColor) {
     var g = state.game;
     if (!g || g.winner) return;
+    // Compute multiplier BEFORE marking winner (depends on board state).
+    var multiplier = gameWinMultiplier(g, winnerColor);
+    var points = g.cube.value * multiplier;
     g.winner = winnerColor;
+    g.lastMultiplier = multiplier;
+    g.lastPoints = points;
     g.phase = 'gameover';
     if (!state.match) state.match = newMatchState(1);
-    var points = g.cube.value;
     if (winnerColor === COLOR_W) state.match.scoreW += points;
     else state.match.scoreB += points;
     clearSavedGame();
     state.aiBusy = false;
+    playSound(winnerColor === COLOR_W ? 'win' : 'lose');
     renderGame();
 
     var matchOver = state.match.scoreW >= state.match.target ||
                     state.match.scoreB >= state.match.target;
 
+    var who = winnerColor === COLOR_W ? 'You' : 'Computer';
+    var winVerb = winnerColor === COLOR_W ? 'win' : 'wins';
+    var typeLabel = multiplier === 3 ? 'Backgammon! ' :
+                    multiplier === 2 ? 'Gammon! ' : '';
+
     if (matchOver) {
-      setTimeout(showMatchOver, 900);
+      if (typeLabel) showToast(typeLabel + who + ' ' + winVerb + ' (+' + points + ')');
+      setTimeout(showMatchOver, multiplier > 1 ? 1400 : 900);
     } else {
-      var who = winnerColor === COLOR_W ? 'You' : 'Computer';
-      showToast(who + ' win' + (winnerColor === COLOR_W ? '' : 's') +
+      showToast(typeLabel + who + ' ' + winVerb +
                 ' game ' + state.match.gameNumber +
                 ' (+' + points + ')');
-      setTimeout(startNextGameInMatch, 2200);
+      setTimeout(startNextGameInMatch, multiplier > 1 ? 2800 : 2200);
     }
   }
 
@@ -1217,12 +1627,17 @@
     var sub = document.getElementById('match-winner-sub');
     emb.className = 'winner-emblem ' + winner;
     emb.textContent = winner === COLOR_W ? '♕' : '♛';
+    var g = state.game;
+    var mult = g && g.lastMultiplier;
+    var typeLabel = mult === 3 ? ' by backgammon' :
+                    mult === 2 ? ' by gammon' : '';
     if (single) {
-      title.textContent = winner === COLOR_W ? 'You win!' : 'Computer wins';
-      sub.textContent = '';
+      title.textContent = (winner === COLOR_W ? 'You win!' : 'Computer wins') + typeLabel;
+      sub.textContent = mult > 1 ? '+' + (g.lastPoints || mult) + ' points' : '';
     } else {
       title.textContent = winner === COLOR_W ? 'Match won!' : 'Computer wins the match';
-      sub.textContent = 'Final score: ' + m.scoreW + ' – ' + m.scoreB;
+      sub.textContent = 'Final score: ' + m.scoreW + ' – ' + m.scoreB +
+                       (typeLabel ? ' (' + typeLabel.trim() + ')' : '');
     }
     navigateTo('matchover');
   }
@@ -1253,6 +1668,22 @@
 
   function setupEvents() {
     document.addEventListener('click', function (e) {
+      // Setup chips (difficulty / sound).
+      var diffChip = e.target.closest('[data-difficulty]');
+      if (diffChip) {
+        state.settings.difficulty = diffChip.dataset.difficulty;
+        saveSettings();
+        syncSetupChips();
+        return;
+      }
+      var soundChip = e.target.closest('[data-sound]');
+      if (soundChip) {
+        state.settings.soundOn = soundChip.dataset.sound === 'on';
+        saveSettings();
+        syncSetupChips();
+        return;
+      }
+
       var pt = e.target.closest('[data-pt]');
       if (pt && !pt.classList.contains('focusable')) {
         var p = parseInt(pt.dataset.pt, 10);
@@ -1294,6 +1725,7 @@
   // =================== INIT ===================
   function init() {
     collectScreens();
+    state.settings = loadSettings();
     setupEvents();
     setTimeout(function () {
       navigateTo('home', { addToHistory: false });

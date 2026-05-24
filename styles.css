@@ -105,6 +105,62 @@ body {
   font-size: 26px;
   margin-bottom: 0;
 }
+
+/* Compact variant for screens with more controls (match-setup). */
+.home-content.compact {
+  gap: 10px;
+  padding: 24px;
+}
+.home-content.compact .primary-btn {
+  padding: 13px 40px;
+  font-size: 17px;
+  min-width: 220px;
+}
+.home-content.compact .secondary-btn {
+  padding: 10px 32px;
+  font-size: 14px;
+  min-width: 220px;
+}
+.setup-row {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+}
+.setup-label {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 2px;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+}
+.chip-group {
+  display: flex;
+  gap: 6px;
+}
+.chip {
+  padding: 7px 16px;
+  font-size: 13px;
+  font-weight: 600;
+  background: transparent;
+  color: var(--text-secondary);
+  border: 2px solid var(--text-muted);
+  border-radius: 999px;
+  cursor: pointer;
+  transition: background 0.18s ease, color 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease;
+  font-family: inherit;
+  letter-spacing: 0.3px;
+}
+.chip:focus {
+  outline: none;
+  border-color: var(--focus-ring);
+  box-shadow: 0 0 14px var(--focus-glow);
+}
+.chip.active {
+  background: var(--gold);
+  color: #1a0f08;
+  border-color: var(--gold);
+}
 .home-sub {
   font-size: 15px;
   color: var(--text-secondary);
@@ -656,6 +712,28 @@ body {
   background: radial-gradient(circle at 32% 28%, var(--checker-black-1), var(--checker-black-2) 80%);
   box-shadow: 0 0 32px rgba(80,80,80,0.4);
   color: #fff;
+}
+
+/* =================== ANIMATION GHOST CHECKER =================== */
+/* Used briefly when a checker bears off (no destination DOM exists). */
+.ghost-checker {
+  position: fixed;
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  pointer-events: none;
+  z-index: 60;
+  will-change: left, top, opacity;
+}
+.ghost-checker.w {
+  background: radial-gradient(circle at 32% 28%, #ffffff 0%, var(--checker-white-1) 35%, var(--checker-white-2) 90%);
+  box-shadow: inset 0 0 0 1.5px var(--checker-white-ring),
+              0 1px 2px rgba(0,0,0,0.4);
+}
+.ghost-checker.b {
+  background: radial-gradient(circle at 32% 28%, #6a6a72 0%, var(--checker-black-1) 35%, var(--checker-black-2) 90%);
+  box-shadow: inset 0 0 0 1.5px var(--checker-black-ring),
+              0 1px 2px rgba(0,0,0,0.4);
 }
 
 /* =================== TOAST =================== */

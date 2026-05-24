@@ -859,24 +859,68 @@
     osc.stop(t + dur + 0.02);
   }
 
-  function sndRoll(ctx) {
-    // Brief noise burst (dice tumble) then a couple of clicks (settle).
-    var dur = 0.22;
-    var buf = ctx.createBuffer(1, Math.floor(dur * ctx.sampleRate), ctx.sampleRate);
+  // A single plastic-dice impact: a fast-decaying bandpass-filtered noise
+  // burst (the "tk" of the cube hitting wood) layered with a brief
+  // low-frequency sine thump (the body of the impact). Pitch and volume
+  // vary per call so a sequence sounds natural rather than mechanical.
+  function diceClick(ctx, when, freq, vol) {
+    var dur = 0.035;
+    var sampleRate = ctx.sampleRate;
+    var bufLen = Math.floor(dur * sampleRate);
+    var buf = ctx.createBuffer(1, bufLen, sampleRate);
     var data = buf.getChannelData(0);
-    for (var i = 0; i < data.length; i++) {
-      var t = i / ctx.sampleRate;
-      data[i] = (Math.random() * 2 - 1) * Math.exp(-t * 14) * 0.35;
+    for (var i = 0; i < bufLen; i++) {
+      var t = i / sampleRate;
+      data[i] = (Math.random() * 2 - 1) * Math.exp(-t * 90);
     }
     var src = ctx.createBufferSource();
     src.buffer = buf;
-    var hp = ctx.createBiquadFilter();
-    hp.type = 'highpass';
-    hp.frequency.value = 800;
-    src.connect(hp).connect(ctx.destination);
-    src.start();
-    setTimeout(function () { sndClick(ctx, 420, 0.04, 0.12); }, 200);
-    setTimeout(function () { sndClick(ctx, 360, 0.05, 0.10); }, 270);
+
+    var bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.value = freq;
+    bp.Q.value = 5;
+
+    var gain = ctx.createGain();
+    gain.gain.value = vol;
+    src.connect(bp).connect(gain).connect(ctx.destination);
+    src.start(when);
+    src.stop(when + dur + 0.01);
+
+    // Low-frequency body for louder impacts (the "thock" under the click).
+    if (vol > 0.08) {
+      var osc = ctx.createOscillator();
+      var oscGain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(180, when);
+      osc.frequency.exponentialRampToValueAtTime(70, when + 0.04);
+      oscGain.gain.setValueAtTime(0.0001, when);
+      oscGain.gain.exponentialRampToValueAtTime(vol * 0.5, when + 0.002);
+      oscGain.gain.exponentialRampToValueAtTime(0.0001, when + 0.05);
+      osc.connect(oscGain).connect(ctx.destination);
+      osc.start(when);
+      osc.stop(when + 0.06);
+    }
+  }
+
+  function sndRoll(ctx) {
+    // Two dice tumbling and settling. Each die produces a sequence of
+    // impacts of decreasing amplitude (initial big hit, a couple of
+    // bounces, then a final small click as it stops spinning).
+    var now = ctx.currentTime;
+
+    function scheduleDie(baseOffset, hits) {
+      hits.forEach(function (t, i) {
+        var when = now + baseOffset + t + (Math.random() - 0.5) * 0.02;
+        var vol = Math.max(0.04, 0.24 - i * 0.045);
+        var freq = 1600 + Math.random() * 1400;  // plastic-click range
+        diceClick(ctx, when, freq, vol);
+      });
+    }
+
+    // Two dice — slightly different timing so they don't sound like one
+    scheduleDie(0,    [0,    0.07, 0.16, 0.27, 0.38]);
+    scheduleDie(0.03, [0.02, 0.10, 0.20, 0.31, 0.42]);
   }
 
   function sndHit(ctx) {

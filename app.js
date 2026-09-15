@@ -26,6 +26,35 @@
   };
 
   var screens = {};
+  var flowEpoch = 0, deferred = [], helpReturn = 'home', helpPage = 0;
+  var appScale = 1;
+  function fit() {
+    var width = document.documentElement.clientWidth, height = document.documentElement.clientHeight;
+    appScale = Math.min(width / 600, height / 600, 1.5);
+    document.documentElement.style.setProperty('--scale', appScale);
+    document.documentElement.style.setProperty('--board-scale', Math.min(1, (width - 16) / 584));
+    if (width < 600 && height > width) appScale = Math.min(1, (width - 16) / 584);
+  }
+  function cancelFlow() { flowEpoch++; deferred = []; state.animating = false; }
+  function later(fn, ms) {
+    var epoch = flowEpoch;
+    setTimeout(function () {
+      if (epoch !== flowEpoch) return;
+      if (state.currentScreen !== 'game') { deferred.push(fn); return; }
+      fn();
+    }, ms);
+  }
+  function pauseGame() {
+    if (!state.game || state.currentScreen !== 'game') return;
+    saveGame();
+    navigateTo('pause', { addToHistory: false });
+  }
+  function resumeGame() {
+    navigateTo('game', { addToHistory: false });
+    renderGame();
+    var waiting = deferred.splice(0);
+    waiting.forEach(function (fn) { later(fn, 40); });
+  }
 
   function loadSettings() {
     try {
@@ -65,6 +94,7 @@
       scoreW: 0,
       scoreB: 0,
       gameNumber: 1,
+      crawfordPlayed: false,
     };
   }
 
@@ -95,6 +125,7 @@
       legalDests: [],
       phase: 'need-roll',
       winner: null,
+      opening: true,
       // Doubling cube. owner === null means centered (either player can offer).
       cube: { value: 1, owner: null },
       // While a double is being negotiated.
@@ -107,13 +138,10 @@
   }
 
   // =================== PERSISTENCE ===================
-  // Save only at stable points (not mid-AI animation). The saved snapshot is
-  // always either a fresh game or a state where it's the human's turn — so
-  // resuming never lands in the middle of the computer thinking.
+  // Save each committed board mutation. Continue resumes computer turns and
+  // cube offers; saved round results preserve match points until Next game.
   function saveGame() {
     if (!state.game) return;
-    if (state.aiBusy) return;
-    if (state.game.winner) { clearSavedGame(); return; }
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify({
         version: 2,
@@ -140,10 +168,18 @@
         m = newMatchState(1);
       }
       if (!g || !Array.isArray(g.board) || g.board.length !== 24) return null;
-      if (g.winner) return null;
+      function count(n) { return Number.isInteger(n) && n >= 0 && n <= 15; }
+      if (!g.bar || !g.off || !['w','b'].includes(g.turn) || !['need-roll','need-move','gameover'].includes(g.phase)) return null;
+      if (!g.board.every(function(c) { return c === null || (['w','b'].includes(c.color) && count(c.count) && c.count > 0); })) return null;
+      if (!['w','b'].every(function(c) { return count(g.bar[c]) && count(g.off[c]) && g.board.reduce(function(n,p) { return n + (p && p.color === c ? p.count : 0); }, g.bar[c] + g.off[c]) === 15; })) return null;
+      if (!['diceRolled','diceRemaining'].every(function(k) { return Array.isArray(g[k]) && g[k].length <= 4 && g[k].every(function(d) { return Number.isInteger(d) && d >= 1 && d <= 6; }); }) || !Array.isArray(g.diceUsed)) return null;
+      if (!m || !Number.isFinite(m.target) || m.target < 1 || !Number.isFinite(m.scoreW) || !Number.isFinite(m.scoreB)) return null;
       // Backfill cube fields if loading from older save shape.
       if (!g.cube) g.cube = { value: 1, owner: null };
       if (g.cubeOffer === undefined) g.cubeOffer = null;
+      // Never trust cached destinations from an older implementation.
+      g.selected = null;
+      g.legalDests = [];
       return { game: g, match: m };
     } catch (e) {
       return null;
@@ -225,7 +261,7 @@
     return true;
   }
 
-  function legalMovesForSelection(g, source) {
+  function rawMovesForSelection(g, source) {
     var color = g.turn;
     var moves = [];
     var dir = direction(color);
@@ -261,7 +297,7 @@
     return moves;
   }
 
-  function allLegalMoves(g) {
+  function rawLegalMoves(g) {
     var color = g.turn;
     var sources = [];
     if (g.bar[color] > 0) {
@@ -273,9 +309,47 @@
     }
     var moves = [];
     sources.forEach(function (src) {
-      legalMovesForSelection(g, src).forEach(function (m) { moves.push(m); });
+      rawMovesForSelection(g, src).forEach(function (m) { moves.push(m); });
     });
     return moves;
+  }
+
+  var legalCache = new WeakMap();
+  function positionKey(g) {
+    return g.turn + ':' + g.board.map(function(c) { return c ? c.color + c.count : '-'; }).join(',') +
+      ':' + g.bar.w + ',' + g.bar.b + ':' + g.off.w + ',' + g.off.b + ':' + g.diceRemaining.join(',');
+  }
+  function allLegalMoves(g) {
+    var key = positionKey(g), cached = legalCache.get(g);
+    if (cached && cached.key === key) return cached.moves;
+    var memo = new Map();
+    function lengthAfter(position) {
+      if (!position.diceRemaining.length) return 0;
+      var k = positionKey(position);
+      if (memo.has(k)) return memo.get(k);
+      var moves = rawLegalMoves(position), best = 0;
+      for (var i = 0; i < moves.length; i++) {
+        var next = deepClone(position); makeMove(next, moves[i]);
+        best = Math.max(best, 1 + lengthAfter(next));
+        if (best === position.diceRemaining.length) break;
+      }
+      memo.set(k, best); return best;
+    }
+    var candidates = rawLegalMoves(g), best = 0;
+    var scores = candidates.map(function(m) {
+      var next = deepClone(g); makeMove(next, m);
+      var n = 1 + lengthAfter(next); best = Math.max(best, n); return n;
+    });
+    var moves = candidates.filter(function(m,i) { return scores[i] === best; });
+    // When only one of two different dice can be played, use the higher.
+    if (best === 1 && g.diceRemaining.length === 2 && g.diceRemaining[0] !== g.diceRemaining[1]) {
+      var high = Math.max.apply(null, moves.map(function(m) { return m.die; }));
+      moves = moves.filter(function(m) { return m.die === high; });
+    }
+    legalCache.set(g, { key: key, moves: moves }); return moves;
+  }
+  function legalMovesForSelection(g, source) {
+    return allLegalMoves(g).filter(function(m) { return m.from === source; });
   }
 
   function makeMove(g, move) {
@@ -348,6 +422,7 @@
   }
 
   function canOfferDouble(g, color) {
+    if (g.opening || g.crawford) return false;
     // Standard rule: cube can only be offered at the start of your turn,
     // before rolling. The cube must be centered or owned by you.
     if (g.winner) return false;
@@ -538,16 +613,22 @@
     var lightCol = isTop ? (col % 2 === 0) : (col % 2 === 1);
 
     var classes = ['point', isTop ? 'top' : 'bot', lightCol ? 'light' : 'dark'];
-    var canFocus = isFocusableSource(g, idx) || isDestPoint(g, idx) || (g.selected === idx);
+    var canFocus = !state.aiBusy && !state.animating && (isFocusableSource(g, idx) || isDestPoint(g, idx) || (g.selected === idx));
     if (canFocus) classes.push('focusable');
     if (g.selected === idx) classes.push('selected');
     if (isDestPoint(g, idx)) classes.push('dest');
 
-    var attrs = 'data-pt="' + idx + '" data-zone="' + (isTop ? 'top' : 'bot') + '" data-col="' + col + '"';
+    var desc = 'Point ' + (idx + 1) + (cell ? ', ' + cell.count + (cell.color === COLOR_W ? ' ivory' : ' jade') : ', empty');
+    var destMove = g.legalDests.find(function(m) { return m.to === idx; });
+    if (destMove) desc += ', move using ' + destMove.die;
+    var attrs = 'aria-label="' + desc + '" data-pt="' + idx + '" data-zone="' + (isTop ? 'top' : 'bot') + '" data-col="' + col + '"';
     if (!canFocus) attrs += ' tabindex="-1"';
 
     var html = '<button class="' + classes.join(' ') + '" ' + attrs + '>';
     html += '<span class="tri"></span>';
+    html += '<span class="point-number">' + (idx + 1) + '</span>';
+    if (g.selected === idx) html += '<span class="move-label">◆</span>';
+    else if (destMove) html += '<span class="move-label">' + destMove.die + ' ↓</span>';
 
     if (cell) {
       var visible = Math.min(cell.count, MAX_VISIBLE_CHECKERS);
@@ -584,7 +665,8 @@
     function setBar(el, count, focusable, selected) {
       if (count > 0) {
         el.classList.remove('hidden');
-        el.innerHTML = count > 1 ? '<span class="bar-count">' + count + '</span>' : '';
+        el.innerHTML = '<span class="bar-count">' + count + '</span>';
+        el.setAttribute('aria-label', count + ' checkers on the bar; enter these first');
       } else {
         el.classList.add('hidden');
         el.innerHTML = '';
@@ -628,7 +710,7 @@
     var classes = ['die'];
     if (used) classes.push('used');
     if (small) classes.push('doubles-extra');
-    var html = '<div class="' + classes.join(' ') + '">';
+    var html = '<div class="' + classes.join(' ') + '" role="img" aria-label="Die ' + value + (used ? ', used' : ', available') + '">';
     for (var i = 0; i < 9; i++) {
       html += '<span class="pip' + (pipSet[i] ? '' : ' empty') + '"></span>';
     }
@@ -690,10 +772,10 @@
     var showDouble = canOfferDouble(g, COLOR_W) && !state.aiBusy && !ourOfferPending;
     setBtn(dbl, showDouble, showDouble, false);
 
-    var canUndo = human && state.snapshot && g.phase !== 'need-roll' && !g.winner && !g.cubeOffer;
+    var canUndo = human && !state.animating && state.snapshot && g.phase !== 'need-roll' && !g.winner && !g.cubeOffer;
     setBtn(undo, !!canUndo, !!canUndo, false);
 
-    var stuck = human && g.phase === 'need-move' && g.diceRemaining.length > 0
+    var stuck = human && !state.animating && g.phase === 'need-move'
                 && allLegalMoves(g).length === 0 && !g.cubeOffer;
     setBtn(end, !!stuck, !!stuck, false);
 
@@ -702,12 +784,14 @@
       canBear = g.legalDests.some(function (m) { return m.to === 'off'; });
     }
     setBtn(bear, canBear, canBear, canBear);
+    var cancel = document.getElementById('cancel-btn');
+    setBtn(cancel, human && g.selected !== null && !state.animating, human && g.selected !== null && !state.animating, false);
   }
 
   function renderHeader() {
     var g = state.game;
-    document.getElementById('white-remaining').textContent = 15 - g.off.w;
-    document.getElementById('black-remaining').textContent = 15 - g.off.b;
+    document.getElementById('white-remaining').innerHTML = g.off.w + ' / 15<span class="home-word"> home</span>';
+    document.getElementById('black-remaining').innerHTML = g.off.b + ' / 15<span class="home-word"> home</span>';
   }
 
   function renderMidbarLabel() {
@@ -716,7 +800,7 @@
     // Hide the turn label whenever we're showing the cube — keeps the
     // midbar uncluttered.
     if (g.winner) { label.textContent = ''; return; }
-    label.textContent = g.turn === COLOR_W ? 'WHITE' : 'BLACK';
+    label.textContent = g.turn === COLOR_W ? 'YOU: 24 → 1 → HOME' : 'COMPUTER: 1 → 24';
   }
 
   function renderCube() {
@@ -751,11 +835,10 @@
     var el = document.getElementById('match-score');
     if (!el) return;
     if (!state.match || state.match.length === 1) {
-      el.textContent = '';
+      el.textContent = state.game.opening ? 'Higher die starts' : 'Single game · ' + getDifficulty();
       return;
     }
-    el.textContent = 'Match ' + state.match.scoreW + ' – ' + state.match.scoreB +
-                     ' (to ' + state.match.target + ')';
+    el.textContent = state.match.scoreW + ' – ' + state.match.scoreB + ' · First to ' + state.match.target + (state.game.crawford ? ' · No cube' : '');
   }
 
   function renderStatus() {
@@ -774,12 +857,14 @@
       return;
     }
     if (state.aiBusy) { st.textContent = 'Computer thinking…'; return; }
+    if (g.opening) { st.textContent = 'Roll to see who starts'; return; }
     if (g.turn === COLOR_W) {
       if (g.phase === 'need-roll') {
         st.textContent = canOfferDouble(g, COLOR_W)
           ? 'Your turn — roll or double'
           : 'Your turn — roll the dice';
       }
+      else if (!allLegalMoves(g).length) st.textContent = 'Move complete — end turn';
       else if (g.bar.w > 0) st.textContent = 'Enter from the bar';
       else if (g.selected !== null) st.textContent = 'Choose a destination';
       else st.textContent = 'Choose a checker to move';
@@ -790,6 +875,8 @@
 
   function renderGame() {
     if (!state.game) return;
+    var active = document.activeElement;
+    var focusPoint = active && active.dataset.pt;
     renderHeader();
     renderBoardRows();
     renderBarCheckers();
@@ -800,6 +887,10 @@
     renderMidbarLabel();
     renderCube();
     renderMatchScore();
+    if (focusPoint !== undefined && state.currentScreen === 'game') {
+      var replacement = document.querySelector('[data-pt="' + focusPoint + '"].focusable');
+      if (replacement) replacement.focus();
+    }
   }
 
   // =================== SOUND ===================
@@ -994,7 +1085,7 @@
       toast = document.createElement('div');
       toast.id = 'toast';
       toast.className = 'toast';
-      document.body.appendChild(toast);
+      document.getElementById('app').appendChild(toast);
     }
     toast.textContent = msg;
     toast.classList.add('visible');
@@ -1026,9 +1117,12 @@
 
   function navigateBack() {
     if (state.currentScreen === 'game' && state.game && !state.game.winner) {
-      // Don't auto-back out of an active game on Escape
+      if (state.game.selected !== null && !state.aiBusy) deselect(); else pauseGame();
       return;
     }
+    if (state.currentScreen === 'help') { navigateTo(helpReturn, { addToHistory: false }); return; }
+    if (state.currentScreen === 'pause') { resumeGame(); return; }
+    if (state.currentScreen === 'match-setup') { navigateTo('home', { addToHistory: false }); return; }
     if (state.screenHistory.length > 0) {
       navigateTo(state.screenHistory.pop(), { addToHistory: false });
     }
@@ -1188,8 +1282,8 @@
   function flipAnimate(el, fromPos, toPos, duration) {
     return new Promise(function (resolve) {
       if (!el || !fromPos || !toPos) { resolve(); return; }
-      var dx = fromPos.x - toPos.x;
-      var dy = fromPos.y - toPos.y;
+      var dx = (fromPos.x - toPos.x) / appScale;
+      var dy = (fromPos.y - toPos.y) / appScale;
       if (Math.abs(dx) < 1 && Math.abs(dy) < 1) { resolve(); return; }
       el.style.transition = 'none';
       el.style.transform = 'translate(' + dx + 'px, ' + dy + 'px)';
@@ -1222,6 +1316,7 @@
       if (!fromPos || !toPos) { resolve(); return; }
       var ghost = document.createElement('div');
       ghost.className = 'ghost-checker ' + color;
+      ghost.style.transform = 'scale(' + appScale + ')';
       document.body.appendChild(ghost);
       ghost.style.left = (fromPos.x - 17) + 'px';
       ghost.style.top = (fromPos.y - 17) + 'px';
@@ -1265,6 +1360,7 @@
 
       // 2. Mutate state, play sound, clear selection, then render.
       makeMove(g, move);
+      saveGame();
       playSound(hit ? 'hit' : 'move');
       g.selected = null;
       g.legalDests = [];
@@ -1296,6 +1392,7 @@
 
   // =================== ACTIONS / FLOW ===================
   function startNewGame() {
+    cancelFlow();
     // "New game" — go to match-setup so user can pick length.
     state.snapshot = null;
     state.aiBusy = false;
@@ -1303,6 +1400,7 @@
   }
 
   function startMatch(length) {
+    cancelFlow();
     state.match = newMatchState(length, state.settings && state.settings.difficulty);
     state.game = newGameState();
     state.snapshot = null;
@@ -1310,42 +1408,60 @@
     saveGame();
     navigateTo('game', { addToHistory: false });
     renderGame();
-    setTimeout(focusFirstActionable, 80);
+    later(focusFirstActionable, 80);
   }
 
   function syncSetupChips() {
     var diff = (state.settings && state.settings.difficulty) || 'normal';
     document.querySelectorAll('[data-difficulty]').forEach(function (c) {
       c.classList.toggle('active', c.dataset.difficulty === diff);
+      c.setAttribute('aria-pressed', c.dataset.difficulty === diff);
     });
     var soundOn = !state.settings || state.settings.soundOn !== false;
     document.querySelectorAll('[data-sound]').forEach(function (c) {
       var on = c.dataset.sound === 'on';
       c.classList.toggle('active', on === soundOn);
+      c.setAttribute('aria-pressed', on === soundOn);
     });
   }
 
   function startNextGameInMatch() {
     if (!state.match) return;
+    cancelFlow();
     state.match.gameNumber++;
     state.game = newGameState();
+    if (!state.match.crawfordPlayed && state.match.target > 1 &&
+        Math.max(state.match.scoreW, state.match.scoreB) === state.match.target - 1) {
+      state.game.crawford = true;
+      state.match.crawfordPlayed = true;
+    }
     state.snapshot = null;
     state.aiBusy = false;
     saveGame();
+    navigateTo('game', { addToHistory: false });
     renderGame();
-    setTimeout(focusFirstActionable, 80);
+    later(focusFirstActionable, 80);
   }
 
   function continueSavedGame() {
     var saved = loadSavedGame();
     if (!saved) return;
+    cancelFlow();
     state.game = saved.game;
     state.match = saved.match;
     state.snapshot = null;
     state.aiBusy = false;
+    if (state.game.winner) { showResult(); return; }
     navigateTo('game', { addToHistory: state.currentScreen === 'home' });
+    if (gameWinner(state.game)) { onGameEnd(gameWinner(state.game)); return; }
+    if (state.game.cubeOffer && state.game.cubeOffer.by === COLOR_W) {
+      state.aiBusy = true; later(aiRespondToDouble, 500);
+    } else if (state.game.turn === COLOR_B && !state.game.cubeOffer) {
+      state.aiBusy = true;
+      later(state.game.phase === 'need-move' ? playAiMoves : aiTurnStart, 500);
+    }
     renderGame();
-    setTimeout(focusFirstActionable, 80);
+    later(focusFirstActionable, 80);
   }
 
   function rollDice() {
@@ -1374,17 +1490,30 @@
 
   function handleRoll() {
     var g = state.game;
-    if (!g || g.turn !== COLOR_W || g.phase !== 'need-roll' || state.aiBusy) return;
+    if (!g || g.turn !== COLOR_W || g.phase !== 'need-roll' || state.aiBusy || g.cubeOffer) return;
     rollDice();
+    if (g.opening) {
+      // Each player rolls one die. Ties are rerolled on the next activation.
+      if (g.diceRolled[0] === g.diceRolled[1]) {
+        g.diceRolled = g.diceRolled.slice(0, 2);
+        g.diceRemaining = [];
+        g.diceUsed = [false, false];
+        g.phase = 'need-roll'; showToast('Opening tie — roll again'); renderGame(); saveGame(); return;
+      }
+      g.opening = false;
+      g.turn = g.diceRolled[0] > g.diceRolled[1] ? COLOR_W : COLOR_B;
+      if (g.turn === COLOR_B) { state.aiBusy = true; later(playAiMoves, 800); }
+      showToast(g.turn === COLOR_W ? 'Your ivory die is higher — you start' : 'The jade die is higher — computer starts');
+    }
     state.snapshot = null;
     saveGame();
     renderGame();
     if (allLegalMoves(g).length === 0) {
       showToast('No legal moves');
-      setTimeout(endHumanTurn, 1100);
+      focusFirstActionable();
       return;
     }
-    setTimeout(focusFirstActionable, 30);
+    later(focusFirstActionable, 30);
   }
 
   function selectSource(src) {
@@ -1393,7 +1522,7 @@
     g.legalDests = legalMovesForSelection(g, src);
     saveGame();
     renderGame();
-    setTimeout(focusFirstDest, 20);
+    later(focusFirstDest, 20);
   }
 
   function deselect() {
@@ -1402,29 +1531,35 @@
     g.legalDests = [];
     saveGame();
     renderGame();
-    setTimeout(focusFirstActionable, 20);
+    later(focusFirstActionable, 20);
   }
 
   function executeMove(move) {
     var g = state.game;
-    if (state.animating) return;
+    if (!g || g.turn !== COLOR_W || state.aiBusy || state.animating || g.cubeOffer || g.phase !== 'need-move') return;
+    move = allLegalMoves(g).find(function(m) { return m.from === move.from && m.to === move.to && m.die === move.die; });
+    if (!move) return;
+    var epoch = flowEpoch;
     state.snapshot = deepClone(g);
     state.animating = true;
     // animateAndApplyMove handles: makeMove, playSound, clear selection,
     // renderGame, then the visual animation. Resolves when animation is done.
     animateAndApplyMove(g, move).then(function () {
+      if (flowEpoch !== epoch || state.game !== g) return;
       state.animating = false;
       var w = gameWinner(g);
       if (w) {
-        setTimeout(function () { onGameEnd(w); }, 300);
+        onGameEnd(w);
         return;
       }
       saveGame();
       if (g.diceRemaining.length === 0 || allLegalMoves(g).length === 0) {
         if (g.diceRemaining.length > 0) showToast('No more moves');
-        setTimeout(endHumanTurn, END_TURN_DELAY);
+        renderGame();
+        if (state.currentScreen === 'game') document.getElementById('end-btn').focus();
       } else {
-        setTimeout(focusFirstActionable, 30);
+        renderGame();
+        later(focusFirstActionable, 30);
       }
     });
   }
@@ -1455,17 +1590,19 @@
   }
 
   function handleUndo() {
-    if (!state.snapshot || state.aiBusy) return;
+    if (!state.snapshot || state.aiBusy || state.animating) return;
     state.game = state.snapshot;
+    state.game.selected = null;
+    state.game.legalDests = [];
     state.snapshot = null;
     saveGame();
     renderGame();
-    setTimeout(focusFirstActionable, 30);
+    later(focusFirstActionable, 30);
   }
 
   function endHumanTurn() {
     var g = state.game;
-    if (!g || g.turn !== COLOR_W || g.winner) return;
+    if (!g || g.turn !== COLOR_W || g.winner || g.phase !== 'need-move' || state.animating || g.cubeOffer || allLegalMoves(g).length) return;
     g.diceRolled = [];
     g.diceRemaining = [];
     g.diceUsed = [];
@@ -1474,8 +1611,10 @@
     g.turn = COLOR_B;
     g.phase = 'need-roll';
     state.snapshot = null;
+    state.aiBusy = true;
+    saveGame();
     renderGame();
-    setTimeout(aiTurnStart, 600);
+    later(aiTurnStart, 600);
   }
 
   // AI's turn begins with the cube decision. If we offer, control passes
@@ -1483,10 +1622,10 @@
   // aiTurnRoll() is called to actually play the turn.
   function aiTurnStart() {
     var g = state.game;
-    if (!g || g.winner) return;
+    if (!g || g.winner || g.turn !== COLOR_B || g.cubeOffer) return;
     state.aiBusy = true;
     renderGame();
-    setTimeout(function () {
+    later(function () {
       if (aiShouldOfferDouble(g)) {
         aiOfferDouble();
       } else {
@@ -1504,7 +1643,7 @@
     playSound('cube');
     saveGame();
     renderGame();
-    setTimeout(focusFirstActionable, 30);
+    later(focusFirstActionable, 30);
   }
 
   function aiTurnRoll() {
@@ -1512,11 +1651,12 @@
     state.aiBusy = true;
     renderGame();
     rollDice();
+    saveGame();
     renderGame();
-    setTimeout(function () {
+    later(function () {
       if (allLegalMoves(g).length === 0) {
         showToast('Computer has no moves');
-        setTimeout(endAiTurn, 900);
+        later(endAiTurn, 900);
         return;
       }
       playAiMoves();
@@ -1534,7 +1674,7 @@
     playSound('cube');
     saveGame();
     renderGame();
-    setTimeout(aiRespondToDouble, 800);
+    later(aiRespondToDouble, 800);
   }
 
   function aiRespondToDouble() {
@@ -1549,13 +1689,13 @@
       showToast('Computer accepts');
       saveGame();
       renderGame();
-      setTimeout(focusFirstActionable, 30);
+      later(focusFirstActionable, 30);
     } else {
       // Decline — player wins this game at the OLD cube value.
       showToast('Computer declines — you win this game');
       g.cubeOffer = null;
       state.aiBusy = false;
-      setTimeout(function () { onGameEnd(COLOR_W); }, 700);
+      onGameEnd(COLOR_W, true);
     }
   }
 
@@ -1565,12 +1705,13 @@
     g.cube.value = g.cubeOffer.value;
     g.cube.owner = COLOR_W;
     g.cubeOffer = null;
+    state.aiBusy = true;
     playSound('cube');
     showToast('You accept');
     saveGame();
     renderGame();
     // AI was about to roll — continue AI's turn.
-    setTimeout(aiTurnRoll, 500);
+    later(aiTurnRoll, 500);
   }
 
   function handleDeclineDouble() {
@@ -1578,12 +1719,15 @@
     if (!g || !g.cubeOffer || g.cubeOffer.by !== COLOR_B) return;
     showToast('You decline');
     g.cubeOffer = null;
-    setTimeout(function () { onGameEnd(COLOR_B); }, 700);
+    onGameEnd(COLOR_B, true);
   }
 
   function playAiMoves() {
     var g = state.game;
+    var epoch = flowEpoch;
+    state.aiBusy = true;
     function next() {
+      if (epoch !== flowEpoch || state.game !== g || g.turn !== COLOR_B) return;
       if (!g || g.winner) { endAiTurn(); return; }
       if (g.diceRemaining.length === 0) { endAiTurn(); return; }
       var move = aiPickBestMove(g);
@@ -1591,17 +1735,18 @@
       g.selected = move.from === 'bar' ? 'bar' : move.from;
       g.legalDests = [move];
       renderGame();
-      setTimeout(function () {
+      later(function () {
         animateAndApplyMove(g, move).then(function () {
+          if (epoch !== flowEpoch || state.game !== g) return;
           var w = gameWinner(g);
           if (w) {
-            setTimeout(function () {
+            later(function () {
               state.aiBusy = false;
               onGameEnd(w);
             }, 500);
             return;
           }
-          setTimeout(next, AI_MOVE_DELAY - 60);
+          later(next, AI_MOVE_DELAY - 60);
         });
       }, AI_SELECT_DELAY);
     }
@@ -1622,14 +1767,14 @@
     state.snapshot = null;
     saveGame();
     renderGame();
-    setTimeout(focusFirstActionable, 30);
+    later(focusFirstActionable, 30);
   }
 
-  function onGameEnd(winnerColor) {
+  function onGameEnd(winnerColor, dropped) {
     var g = state.game;
     if (!g || g.winner) return;
     // Compute multiplier BEFORE marking winner (depends on board state).
-    var multiplier = gameWinMultiplier(g, winnerColor);
+    var multiplier = dropped ? 1 : gameWinMultiplier(g, winnerColor);
     var points = g.cube.value * multiplier;
     g.winner = winnerColor;
     g.lastMultiplier = multiplier;
@@ -1638,7 +1783,7 @@
     if (!state.match) state.match = newMatchState(1);
     if (winnerColor === COLOR_W) state.match.scoreW += points;
     else state.match.scoreB += points;
-    clearSavedGame();
+    saveGame();
     state.aiBusy = false;
     playSound(winnerColor === COLOR_W ? 'win' : 'lose');
     renderGame();
@@ -1651,15 +1796,27 @@
     var typeLabel = multiplier === 3 ? 'Backgammon! ' :
                     multiplier === 2 ? 'Gammon! ' : '';
 
-    if (matchOver) {
-      if (typeLabel) showToast(typeLabel + who + ' ' + winVerb + ' (+' + points + ')');
-      setTimeout(showMatchOver, multiplier > 1 ? 1400 : 900);
-    } else {
-      showToast(typeLabel + who + ' ' + winVerb +
-                ' game ' + state.match.gameNumber +
-                ' (+' + points + ')');
-      setTimeout(startNextGameInMatch, multiplier > 1 ? 2800 : 2200);
-    }
+    if (state.currentScreen === 'game') showResult();
+    else deferred.push(showResult);
+  }
+
+  function showResult() {
+    if (state.match.scoreW >= state.match.target || state.match.scoreB >= state.match.target) { showMatchOver(); return; }
+    var g = state.game;
+    document.getElementById('winner-emblem').textContent = '♕';
+    document.getElementById('winner-title').textContent = g.winner === COLOR_W ? 'You win this round' : 'Computer wins this round';
+    document.getElementById('winner-sub').textContent = '+' + g.lastPoints + ' points · Match ' + state.match.scoreW + ' – ' + state.match.scoreB;
+    navigateTo('gameover', { addToHistory: false });
+  }
+
+  var helpPages = [
+    '<h2>Move your ivory checkers home</h2><p>Roll one die each to start. The higher die plays first, using both numbers. On later turns, roll two dice.</p><p>Follow the numbers from 24 down to 1. Bring all 15 ivory checkers into points 1–6, then bear them off.</p>',
+    '<h2>Choose a checker, then its landing</h2><p>Use arrows or your band’s D-pad to focus a control. Pinch / Enter activates it. You can also tap the board.</p><p>The ◆ marks your selected checker. Outlined landings show the die they use. Cancel changes your choice. Undo is available until you End Turn.</p>',
+    '<h2>Hits, dice &amp; match points</h2><p>A lone enemy checker can be hit. Checkers on the bar must enter first. Use both dice when possible; if only one fits, use the higher. Doubles give four moves.</p><p>A gammon scores 2×, backgammon 3×. Declining a double loses the old cube value. The first one-point-away round has no doubling (Crawford).</p>'
+  ];
+  function renderHelp() {
+    document.getElementById('help-copy').innerHTML = helpPages[helpPage];
+    document.getElementById('help-page').textContent = (helpPage + 1) + ' / ' + helpPages.length;
   }
 
   function showMatchOver() {
@@ -1695,7 +1852,16 @@
       case 'match-3': startMatch(3); break;
       case 'match-5': startMatch(5); break;
       case 'match-7': startMatch(7); break;
+      case 'next-round': startNextGameInMatch(); break;
+      case 'pause': pauseGame(); break;
+      case 'resume': resumeGame(); break;
+      case 'cancel': deselect(); break;
+      case 'help': helpReturn = state.currentScreen; helpPage = 0; renderHelp(); navigateTo('help', { addToHistory: false }); break;
+      case 'help-prev': helpPage = (helpPage + helpPages.length - 1) % helpPages.length; renderHelp(); break;
+      case 'help-next': helpPage = (helpPage + 1) % helpPages.length; renderHelp(); break;
+      case 'help-close': navigateTo(helpReturn, { addToHistory: false }); break;
       case 'home':
+        saveGame(); cancelFlow();
         state.screenHistory = [];
         navigateTo('home', { addToHistory: false });
         break;
@@ -1712,6 +1878,7 @@
 
   function setupEvents() {
     document.addEventListener('click', function (e) {
+      if (!screens[state.currentScreen].contains(e.target)) return;
       // Setup chips (difficulty / sound).
       var diffChip = e.target.closest('[data-difficulty]');
       if (diffChip) {
@@ -1729,14 +1896,7 @@
       }
 
       var pt = e.target.closest('[data-pt]');
-      if (pt && !pt.classList.contains('focusable')) {
-        var p = parseInt(pt.dataset.pt, 10);
-        if (state.game && state.game.selected !== null) {
-          var move = state.game.legalDests.find(function (m) { return m.to === p; });
-          if (move) { executeMove(move); return; }
-        }
-      }
-      if (pt && pt.classList.contains('focusable')) {
+      if (pt) {
         handlePointClick(parseInt(pt.dataset.pt, 10));
         return;
       }
@@ -1753,6 +1913,7 @@
         case 'ArrowLeft': moveFocus('left'); e.preventDefault(); break;
         case 'ArrowRight': moveFocus('right'); e.preventDefault(); break;
         case 'Enter':
+          if (e.repeat) { e.preventDefault(); break; }
           if (document.activeElement && document.activeElement.classList.contains('focusable')) {
             document.activeElement.click();
           }
@@ -1768,12 +1929,26 @@
 
   // =================== INIT ===================
   function init() {
+    fit(); window.addEventListener('resize', fit);
     collectScreens();
     state.settings = loadSettings();
     setupEvents();
-    setTimeout(function () {
-      navigateTo('home', { addToHistory: false });
-    }, 60);
+    window.addEventListener('pagehide', saveGame);
+    navigateTo('home', { addToHistory: false });
+  }
+
+  window.render_game_to_text = function () {
+    var g = state.game;
+    return JSON.stringify({ screen: state.currentScreen, focus: document.activeElement && (document.activeElement.dataset.action || document.activeElement.getAttribute('aria-label')), aiBusy: state.aiBusy,
+      coordinates: '24 points; ivory moves 24 down to 1, jade 1 up to 24; top left to right 13–24, bottom left to right 12–1',
+      game: g && { turn:g.turn, phase:g.phase, opening:g.opening, board:g.board, bar:g.bar, off:g.off, dice:g.diceRemaining, selected:g.selected, legal:g.legalDests, cube:g.cube, cubeOffer:g.cubeOffer, winner:g.winner }, match:state.match });
+  };
+  window.advanceTime = function(ms) { return new Promise(function(resolve) { setTimeout(resolve, Math.max(0, Math.min(ms, 30000))); }); };
+  // Local verification only; no hidden gameplay controls in the deployed app.
+  if (location.hostname === '127.0.0.1' && new URLSearchParams(location.search).has('test')) {
+    window.__bg = { state:state, newGame:newGameState, newMatch:newMatchState, legal:allLegalMoves, raw:rawLegalMoves, move:makeMove, multiplier:gameWinMultiplier, canDouble:canOfferDouble,
+      load:loadSavedGame, save:saveGame, result:onGameEnd, nextRound:startNextGameInMatch, start:startMatch, action:handleAction,
+      set:function(g,m) { cancelFlow(); state.game=g; state.match=m||newMatchState(7); state.aiBusy=false; state.snapshot=null; navigateTo('game',{addToHistory:false}); renderGame(); }, render:renderGame };
   }
 
   if (document.readyState === 'loading') {

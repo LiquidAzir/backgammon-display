@@ -6,11 +6,12 @@ Built with the [Meta Wearables Web App](https://github.com/facebookincubator/met
 
 ## How to play
 
-- **Roll** — Press the Roll button (Enter / pinch). Doubles award 4 moves of the same value.
+- **Opening roll** — Each side rolls one die; the higher die starts using both numbers. Ties reroll. Later turns use two dice, with four moves for doubles.
 - **Pick a checker** — Navigate with arrow keys / Neural Band swipes. Press Enter on a point you own.
-- **Move** — Legal destinations pulse emerald; the selected checker glows amber. Press Enter on a destination.
+- **Move** — The selected checker has a diamond marker. Outlined destinations show the die they use. Press Enter or tap a destination. Legal choices preserve the maximum number of playable dice, including the higher-die rule.
 - **Bear off** — Once all your checkers are in your home board (points 1–6), the **Bear Off** action button appears as a legal destination.
-- **Undo** — Reverts the last move within your turn.
+- **Undo** — Reverts the last move before you press **End Turn**. The game waits for you to confirm the turn, so a timer cannot commit it while you undo.
+- **Menu** — Pause, read the three-page guide, or save and return home. This button is reachable through touch and the D-pad, including during computer turns.
 - **Re-enter from bar** — If you're hit, you must enter from the bar before any other move.
 
 Standard backgammon rules: hit a blot to send the opponent's checker to the bar; you can't land on a point with 2+ opponent checkers.
@@ -21,15 +22,21 @@ Standard backgammon rules: hit a blot to send the opponent's checker to the bar;
 |-------|--------|
 | Arrow keys / D-pad | Move focus (spatial navigation on the board) |
 | Enter / pinch | Select / activate |
-| Escape | Back (only outside of an active game) |
+| Escape | Cancel a checker selection; otherwise pause / go back |
+| Touch | Tap a checker, destination or button |
+
+Single games and matches to 2, 3 or 4 points are available. These labels reflect the existing saved match targets. A declined double awards the previous cube value, without gammon multipliers. The first round after either player reaches one point short of the target disables doubling (Crawford).
+
+Rules reference: [U.S. Backgammon Federation — How to Play](https://usbgf.org/backgammon-basics-how-to-play/) and [tournament rules](https://usbgf.org/tournament-rules/rules-for-in-person-play/).
 
 ## Layout
 
 - 600×600 viewport, dark theme (black = transparent on the glasses' additive display)
 - Traditional 24-point board, split into 4 quadrants by the central bar
-- Two-tone amber / teal triangles, cream / charcoal checkers
-- Header shows remaining-piece counts and turn status
-- Action panel shows dice + context-aware buttons (Roll, Undo, End Turn, Bear Off)
+- Crafted walnut frame, brass inlay, raised ivory / jade checkers and dimensional dice; all static CSS/SVG with no rendering loop
+- Header shows borne-off counts and turn status; checkmarks distinguish used dice without relying on color
+- Native portrait menus and 46px action buttons on phones; the board scales to fit without cropping
+- Existing `mdg_backgammon` v1/v2 saves and settings are preserved. Computer turns, cube offers, and between-round scores survive reopening
 
 ## Run locally
 
@@ -42,20 +49,15 @@ Arrow keys + Enter simulate the Neural Band on desktop.
 
 ## Deploy
 
-Hosted as a static site — any HTTPS host works. Configured for [Render](https://render.com) via `render.yaml` with two environments:
+Production: [backgammon-display.onrender.com](https://backgammon-display.onrender.com/). The existing Render Static Site deploys from `main` with no build step and the repository root as its publish directory. Existing installations use the same URL and save format. The optional staging entry in `render.yaml` is a template; it is not a provisioned service.
 
-| Branch | Render service | URL |
-|--------|---------------|-----|
-| `main` | `backgammon-display` | https://backgammon-display.onrender.com |
-| `staging` | `backgammon-display-staging` | https://backgammon-display-staging.onrender.com |
+For installation, use the current [official Meta Wearables Web App guide](https://github.com/facebook/meta-wearables-webapp). Firmware can deliver a pinch as Enter or a click on the focused element; both work. The in-game Menu avoids relying on a system gesture to leave a game.
 
-Workflow:
+## Verification
 
-1. Develop on a feature branch
-2. Merge to `staging` first — Render auto-deploys to the staging URL. Verify on-device.
-3. When happy, merge `staging` → `main` to ship to production.
+Run `node --test tests/rules.cjs` for rules, legal-turn search, scoring and save compatibility checks. With the game served at `http://127.0.0.1:5202/`, run `node tests/browser.cjs` for isolated browser input, AI continuation, pause, scoring and responsive layout checks. Set `PLAYWRIGHT_MODULE` to the installed Playwright module path when needed. Tests block external requests and use disposable browser storage.
 
-Once live, add the production URL to the glasses via the Meta AI app → Devices → Display Glasses → App connections → Web apps.
+`render_game_to_text()` exposes a read-only state summary and `advanceTime(ms)` lets the web-game client wait through timed AI actions. Fixture mutation helpers exist only on `127.0.0.1` with `?test=1`.
 
 ## Files
 

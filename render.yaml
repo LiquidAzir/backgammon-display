@@ -8,6 +8,9 @@ services:
     staticPublishPath: .
     pullRequestPreviewsEnabled: false
     headers:
+      - path: /manifest.webmanifest
+        name: Content-Type
+        value: application/manifest+json
       - path: /*
         name: X-Frame-Options
         value: SAMEORIGIN
